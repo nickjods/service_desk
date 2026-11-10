@@ -1,1 +1,128 @@
-1
+	            		when sb.obligation_types = 'ОДНВ' and sb.close_status_oblig_end is null 
+	                    	then
+	                        	case
+	                            	when b.has_onetime_stim
+	                            		then b.sum_credit - b.sum_return
+	                            	else 
+		                            	(
+		                            		select f.s_vykup
+		                            		from actuary.get_surrender_value(
+		                            			'PAYMENT', 
+												sb.sharer_id, 
+												p_end_date, 
+												null
+		                            		) f
+		                            	)
+	                	        end
+						else null 
+					end as value,
+					(b.sum_credit - b.sum_return) as sb_value,
+					b.inpayment_ev_value,
+					b.inpayment_add_value,
+					sb.sharer_id
+				from balances b
+				join t_sharer_base_pds_af sb on sb.sharer_id = b.sharer_id
+		),
+		get_balance_end_ops as (
+			select
+				sum(b.total_credit - b.total_debit) as balance_end_OPS,
+				sb.individual_id
+			from back_office.balance b
+			join back_office.account a on b.account_id = a.id
+			join ourpension.sharer s on s.id = a.owner_sharer_id
+			join ourpension.contract c on c.id = s.contract_id
+			join t_sharer_base_pds_af sb on c.individual_id = sb.individual_id
+			join ourpension.fund f on f.id = c.fund_id
+			where b.start_date <= p_end_date
+				and b.end_date >= p_end_date
+				and c.service_type = 'OPS'
+				and (p_name_in_pfr is null or f.name_in_pfr = p_name_in_pfr)
+			group by  sb.individual_id
+		)
+		select	
+			sb.CODE										as CODE,
+			sb.sharer_code_1c::integer	 				as CODE_SHARER,
+			sb.contract_code_1c::integer	 			as CODE_CONTRACT,	
+			sb.sharer_number::text 						as SELFNUMBER_SHARER,
+			sb.contract_number::text	 				as SELFNUMBER_CONTRACT,
+			date(sb.sign_date)::date					as SIGN_DATE,
+			date(sb.effective_date)::date		 		as EFFECTIVE_DATE,
+			fi.inpaymentFirst_DATE::date 				as inpaymentFirst_DATE,
+			sb.name_investor::text		 				as NAME_INVESTOR,
+			sb.investor_sharer::integer					as INVESTOR_SHARER,
+			sb.STATUS_SHARER::text						as STATUS_SHARER,
+			sb.TYPE_GROUP::text							as TYPE_GROUP,
+			sb.sex::text	 							as SEX,
+			sb.birth_date::date		 					as BIRTH_DATE,
+			sb.age::smallint							as AGE,
+			sb.fund::text								as FUND,
+			ps.scheme_contract::text					as SCHEME_CONTRACT,
+			ps.scheme_rule_name::text		 			as SCHEME_NAME,
+			ps.investment_portfolio_name::text		 	as portfolioInvest,
+			sb.ACCOUNT_TYPE::text		 				as ACCOUNT_TYPE,
+			sb.REGISTR_DATE::date 						as REGISTR_DATE,
+			1::integer									as CLASS_SHARER,
+			1::integer 									as contract_type,
+			coalesce(ps.oud, 0)::numeric 				as OUD,
+			null::bigint								as segment,
+			coalesce(sb.value_income, 0) 				as VALUE_INCOME,
+			null::text									as PERIOD_INCOME,
+			ps.assignee_type::text						as ASSIGNEE_TYPE,
+			ps.valueInpaymentContract::numeric			as valueInpaymentContract, --различается
+			sb.GET_ACTUARY_RATE::integer				as GET_ACTUARY_RATE,--нет данных
+			gbe.balance_end::numeric					as BALANCE_END, --не сходится
+			null::numeric 								as BALANCE_BY_PENSION,
+			gbe.balance_end::numeric					as BALANCE_END_IPS,
+			gbt.value::numeric							as BALANCE_TRANSFER,
+			pc.incomeValueTotal::numeric 				as incomeValueTotal, --не сходится
+			pc.INPAYMENT_VALUE::numeric 				as INPAYMENT_VALUE,
+			coalesce(pd.other_trans + pc.other_trans, 0)::numeric		as OTHERTRANSFER_VALUE,
+			coalesce(pd.VALUE_PAY + pc.VALUE_PAY, 0)::numeric			as VALUE_PAY,
+			null::text									as "CONDITION",
+			null::text									as RESPONS,
+			sb.START_DATE_PENSION::date					as START_DATE_PENSION,
+			sb.PERIOD_PENSION::text 					as PERIOD_PENSION,
+			sb.PENSION_VALUE::numeric 					as PENSION_VALUE,
+			1::bigint									as INDEXATION,
+			nppd.PENSION_NEXT_PAY_DATE::date			as PENSION_NEXT_PAY_DATE,
+			sb.suspend_pay_date::date 					as SUSPEND_PAY_DATE,
+			sb.PERIOD_PAY_PENSION::text					as PERIOD_PAY_PENSION,
+			sb.pension_count::integer					as PENSION_COUNT,
+			sb.END_DATE_PAY_PENSION::date				as END_DATE_PAY_PENSION,
+			sb.END_DATE_PENSION_PERIOD::date			as END_DATE_PENSION_PERIOD,
+			sb."TYPE"::integer		 					as "TYPE",
+			null::bigint		 						as FIXED_VALUE,
+			coalesce(sb.ACTUARY_RATE, 0)::numeric		as ACTUARY_RATE, --нет данных
+			pc.value_return::numeric					as valueReturn,
+			pc.transactionInpaymentValue1::numeric	 	as transactionInpaymentValue1,
+			pc.transactionInpaymentValue2::numeric	 	as transactionInpaymentValue2,
+			pc.transactionInpaymentValue3::numeric	 	as transactionInpaymentValue3,
+			'ФЛ'::text 									as SHARER_TYPE,	
+			fi.valueInpaymentFirst::numeric 			as valueInpaymentFirst, --не совпало, проверить
+			coalesce(gbe.balance_by_pension_start, 0)::numeric		as balanceByPensionStart, --не совпало
+			sb.obligation_types::text					as obligationTypes,
+			gbt.inpayment_ev_value::numeric				as inpayment_ev_value,
+			gbt.inpayment_add_value::numeric			as inpayment_add_value,
+			gbt.sb_value::numeric						as inpayment_sb_value,
+			sb.fixing_date::date 						as date_investment_horizont,
+			coalesce(ps.period_investment_horizont, 1)::integer 		as period_investment_horizont,
+			0::numeric 									as value_investment_horizont,
+			case
+            	when sb.obligation_types = 'ОДНВ' 
+            		and sb.close_status_oblig_end is null 
+            		and coalesce(pc.stimul_vznos, pc.sber_vznos, 0) <> 0 
+            	then null::date
+                when gbe.balance_end >= gbt.value
+                then p_end_date
+            end 										as dateCalcRedemption,
+			sb.check_appl_ev::integer					as check_appl_ev,
+			gbeo.balance_end_OPS::numeric				as balance_end_OPS,
+			sb.countPayPension::integer 				as countPayPension,
+			pc.income_last_value::numeric 				as income_last_value
+		from t_sharer_base_pds_af sb
+		left join payments_credit pc on pc.sharer_id = sb.sharer_id
+		left join payments_debit pd on pd.sharer_id = sb.sharer_id
+		left join first_inpay fi on fi.sharer_id = sb.sharer_id
+		left join balances gbe on gbe.sharer_id = sb.sharer_id
+		left join next_pay_pension_date nppd on nppd.sharer_id = sb.sharer_id
+		left join get_balance_end_ops gbeo on gbeo.individual_id = sb.individual_id
