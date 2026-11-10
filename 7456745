@@ -1,0 +1,56 @@
+
+CREATE OR REPLACE FUNCTION actuary.get_af_pds_fl(p_name_in_pfr text, p_start_date date, p_end_date date)
+ RETURNS TABLE(code integer, code_sharer integer, code_contract integer, selfnumber_sharer text, selfnumber_contract text, sign_date date, effective_date date, inpaymentfirst_date date, name_investor text, investor_sharer integer, status_sharer text, type_group text, sex text, birth_date date, age smallint, fund text, scheme_contract text, scheme_name text, portfolioinvest text, account_type text, registr_date date, class_sharer integer, contract_type integer, oud numeric, segment bigint, value_income numeric, period_income text, assignee_type text, valueinpaymentcontract numeric, get_actuary_rate integer, balance_end numeric, balance_by_pension numeric, balance_end_ips numeric, balance_transfer numeric, incomevaluetotal numeric, inpayment_value numeric, othertransfer_value numeric, value_pay numeric, "CONDITION" text, respons text, start_date_pension date, period_pension text, pension_value numeric, indexation bigint, pension_next_pay_date date, suspend_pay_date date, period_pay_pension text, pension_count integer, end_date_pay_pension date, end_date_pension_period date, "TYPE" integer, fixed_value bigint, actuary_rate numeric, valuereturn numeric, transactioninpaymentvalue1 numeric, transactioninpaymentvalue2 numeric, transactioninpaymentvalue3 numeric, sharer_type text, valueinpaymentfirst numeric, balancebypensionstart numeric, obligationtypes text, inpayment_ev_value numeric, inpayment_add_value numeric, inpayment_sb_value numeric, date_investment_horizont date, period_investment_horizont integer, value_investment_horizont numeric, datecalcredemption date, check_appl_ev integer, balance_end_ops numeric, countpaypension integer, income_last_value numeric)
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		v_datetime_end timestamp;
+        -- Заполнить реальными кодами; KA0/LA0/MA0 из исходника
+        -- не являются достаточным подтверждением соответствия названиям.
+        v_status_open text := null;           -- Открыт
+        v_status_active text := null;         -- Действует
+        v_status_payment_period text := null; -- ПериодВыплат
+        v_status_pre_close text := null;      -- ПодготовкаКЗакрытию
+	begin
+		
+		if p_start_date is null or p_end_date is null then 
+			raise exception 'Inputs dates is NULL';
+		end if;
+	
+	v_datetime_end = p_end_date::timestamp + interval '23 hours 59 minutes';
+
+        if p_start_date > p_end_date then
+            raise exception 'Дата начала периода больше даты окончания';
+        end if;
+        if v_status_open is null or v_status_active is null
+           or v_status_payment_period is null or v_status_pre_close is null then
+            raise exception 'Заполните четыре v_status_* кодами статусов в DECLARE';
+        end if;
+
+        -- Все операции по ПДС выбранного фонда до конца отчетного периода.
+        drop table if exists t_tx_pds_af;
+        create temp table t_tx_pds_af on commit drop as
+        select
+            s.id as sharer_id,
+            t.effective_date,
+            t.value,
+            ot.code as operation_code,
+            o.operation_type_id,
+            at2.mnemonics,
+            case
+                when t.credit_account_id = a.id then 'credit'
+                when t.debit_account_id = a.id then 'debit'
+            end as direction,
+            (t.debit_account_id = a.id) as is_debit_account,
+            o.approved,
+            o.deleted,
+            o.revoked
+        from ourpension.sharer s
+        join ourpension.contract c
+          on c.id = s.contract_id and c.service_type = 'PDS'
+        left join ourpension.fund f on f.id = c.fund_id
+        join back_office.account a on a.owner_sharer_id = s.id
+        join back_office.transaction t
+          on a.id in (t.credit_account_id, t.debit_account_id)
+        -- LEFT JOIN не теряет транзакцию при отсутствии справочных данных.
+        left join back_office.operation o on o.id = t.operation_id
