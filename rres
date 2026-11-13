@@ -1,0 +1,1697 @@
+-- DROP FUNCTION actuary.get_surrender_value_ul(int4, date, _int4, jsonb);
+
+CREATE OR REPLACE FUNCTION actuary.get_surrender_value_ul(p_contract_id integer, p_calc_date date, p_sharer_ids integer[] DEFAULT NULL::integer[], additional_params jsonb DEFAULT NULL::jsonb)
+ RETURNS TABLE(contract_id integer, s_vykup_ul numeric, sharer_id integer, s_vykup numeric, s_sr numeric, s_vznos numeric, s_dd numeric, s_mgd numeric, s_vosp numeric, s_vypl numeric, s_perevod numeric, s_finrez numeric, v_sps numeric, k1 numeric, k2 numeric, k3 numeric, k4 numeric, kf numeric, details_json jsonb)
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		v_sharer_ids integer[] = '{}'::integer[];
+		v_sharer_types text[] = '{}'::text[];
+		
+		v_sharer_ids_sps integer[] = '{}'::integer[];
+		v_sharer_ids_kips integer[] = '{}'::integer[];
+	
+		v_is_nonstandard boolean;
+		v_is_ul boolean;
+	
+		v_calc_datetime timestamp;
+		v_round_type text = 'CALC_REDEMPTION_SUM';
+		v_service_type text = 'NPO';
+	begin
+	
+		if p_contract_id is null then
+			return query
+				select
+					null::integer as contract_id, 
+					null::numeric as s_vykup_ul, 
+					null::integer as sharer_id,
+					null::numeric as s_vykup, 
+					null::numeric as s_sr,
+					null::numeric as s_vznos, 
+					null::numeric as s_dd, 
+					null::numeric as s_mgd, 
+					null::numeric as s_vosp, 
+					null::numeric as s_vypl, 
+					null::numeric as s_perevod, 
+					null::numeric as s_finrez, 
+					null::numeric as v_sps, 
+					null::numeric as k1, 
+					null::numeric as k2, 
+					null::numeric as k3, 
+					null::numeric as k4,
+					null::numeric as kf, 
+					null::jsonb   as details_json;	
+			return;
+		end if;
+	
+		if p_calc_date is null then
+			raise exception 'Calculation date is null';
+		end if;
+	
+		v_calc_datetime = p_calc_date::timestamp + interval '23 hours 59 minutes';
+
+		/*Справочник: параметр - переменная.
+		"Sвык" 		- s_vykup,
+		"Sвзн j" 	- s_vznos,
+		"Sдд j" 	- s_dd,
+		"Sмгд j" 	- s_mgd,
+		"Sвосп j" 	- s_vosp,
+		"Sвыпл j" 	- s_vypl,
+ 		"Sперевод j" - s_perevod,
+		"Sфинрез j"	 - s_finrez
+		"Vспс j" 	 - v_sps*/
+		
+		select
+			coalesce(array_agg(sp.sharer_id order by sp.sharer_id)
+				filter(where s.individual_id is not null), '{}'::integer[]) as sharer_ids,
+			coalesce(array_agg(sp.sharer_type order by sp.sharer_type), '{}'::text[]) as sharer_types,
+			bool_or(c.nonstandard_reason_id is not null) as is_nonstandard,
+			bool_or(
+				0 = any(p_sharer_ids)
+				or exists(
+					select 1
+					from back_office.account a
+					where a.owner_contract_id = p_contract_id
+				)
+			) as is_ul
+		into v_sharer_ids, v_sharer_types, v_is_nonstandard, v_is_ul
+		from ourpension.contract c
+		join ourpension.sharer s on s.contract_id = c.id
+		join ourpension.sharer_params sp on sp.sharer_id = s.id and sp.sharer_type in ('SPS','KIPS')
+		left join lateral (
+			select distinct on (ssh.sharer_id)
+				ssh.sharer_id,
+				ssh.code
+			from ourpension.sharer_statuses_history ssh
+			where ssh.sharer_id = s.id
+				and ssh.status_date < v_calc_datetime
+			order by ssh.sharer_id, ssh.status_date desc
+		) status on true
+		where c.id = p_contract_id
+			and (coalesce(cardinality(p_sharer_ids), 0) = 0 or s.id = any(p_sharer_ids))
+			and status.code not in ('IA0', 'JA0');
+		
+		for i in 1..cardinality(v_sharer_ids) loop
+			case v_sharer_types[i]
+				when 'SPS' then
+					v_sharer_ids_sps = array_append(v_sharer_ids_sps, v_sharer_ids[i]);
+				when 'KIPS' then
+					v_sharer_ids_kips = array_append(v_sharer_ids_kips, v_sharer_ids[i]);
+			end case;
+		end loop;
+	
+		if v_is_nonstandard is false
+			and
+				(
+					cardinality(v_sharer_ids_sps) > 0 
+					or cardinality(v_sharer_ids_kips) > 0 
+				)
+			or p_contract_id is not null
+		then
+			return query
+				with base as (
+					select
+						c.id as contract_id,
+						s.id as sharer_id
+					from ourpension.contract c
+					join ourpension.sharer s on s.contract_id = c.id
+					where c.id = p_contract_id
+						and (p_sharer_ids is null or s.id = any(p_sharer_ids))
+				),
+				ul_calc as (
+					--2.1.2.	Расчёт выкупной суммы по СПС (ЮЛ по договору).
+					select
+						p_contract_id as contract_id,
+						uss.sharer_id,
+						greatest(uss.s_vykup, 0) as s_vykup,
+						greatest(uss.s_sr, 0) as s_sr,
+						greatest(uss.s_vznos, 0) as s_vznos,
+						greatest(uss.s_dd, 0) as s_dd,
+						greatest(uss.s_mgd, 0) as s_mgd,
+						greatest(uss.s_vosp, 0) as s_vosp,
+						greatest(uss.s_vypl, 0) as s_vypl,
+						greatest(uss.s_perevod, 0) as s_perevod,
+						greatest(uss.s_finrez, 0) as s_finrez,
+						uss.v_sps,
+						uss.k1,
+						uss.k2,
+						uss.k3,
+						uss.k4,
+						uss.kf,
+						uss.details_json 
+					from actuary.get_surrender_value_ul_sps(p_contract_id, p_calc_date) uss
+					where v_is_ul is true
+				),
+				sps_calc as (
+					--2.1.2.	Расчёт выкупной суммы по СПС.
+					select
+						p_contract_id as contract_id,
+						ss.sharer_id,
+						greatest(ss.s_vykup, 0) as s_vykup,
+						greatest(ss.s_sr, 0) as s_sr,
+						greatest(ss.s_vznos, 0) as s_vznos,
+						greatest(ss.s_dd, 0) as s_dd,
+						greatest(ss.s_mgd, 0) as s_mgd,
+						greatest(ss.s_vosp, 0) as s_vosp,
+						greatest(ss.s_vypl, 0) as s_vypl,
+						greatest(ss.s_perevod, 0) as s_perevod,
+						greatest(ss.s_finrez, 0) as s_finrez,
+						ss.v_sps,
+						ss.k1,
+						ss.k2,
+						ss.k3,
+						ss.k4,
+						ss.kf,
+						ss.details_json 
+					from actuary.get_surrender_sps(v_sharer_ids_sps, p_calc_date) ss
+					where v_sharer_ids_sps is not null
+				),
+				kips_calc as (
+					--2.2.	Расчёт выкупной суммы при корпоративных именных пенсионных счетах.
+					select
+						p_contract_id as contract_id,
+						sk.sharer_id,
+						greatest(sk.s_vykup, 0) as s_vykup,
+						greatest(sk.s_sr, 0) as s_sr,
+						greatest(sk.s_vznos, 0) as s_vznos,
+						greatest(sk.s_dd, 0) as s_dd,
+						greatest(sk.s_mgd, 0) as s_mgd,
+						greatest(sk.s_vosp, 0) as s_vosp,
+						greatest(sk.s_vypl, 0) as s_vypl,
+						greatest(sk.s_perevod, 0) as s_perevod,
+						greatest(sk.s_finrez, 0) as s_finrez,
+						sk.v_sps,
+						sk.k1,
+						sk.k2,
+						sk.k3,
+						sk.k4,
+						sk.kf,
+						sk.details_json
+					from actuary.get_surrender_kips(v_sharer_ids_kips, p_calc_date) sk
+					where v_sharer_ids_kips is not null
+				),
+				res_calc as (
+					select
+						x.*,
+						sum(x.s_vykup) over (
+							partition by x.contract_id
+						) as s_vykup_total
+					from (
+						select * from ul_calc
+						union all
+						select * from sps_calc
+						union all
+						select * from kips_calc
+					) x
+				)
+				select
+					rc.contract_id, 
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(
+							v_round_type, 
+							rc.s_vykup_total, 
+							v_service_type
+						) r
+						)
+					, 0)::numeric,
+					rc.sharer_id,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_vykup, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_sr, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_vznos, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_dd, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_mgd, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_vosp, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_vypl, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_perevod, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.s_finrez, v_service_type) r
+						)
+					, 0)::numeric,
+					coalesce((
+						select r.pension
+						from actuary.round_calc_res(v_round_type, rc.v_sps, v_service_type) r
+						)
+					, 0)::numeric, 
+					rc.k1, 
+					rc.k2, 
+					rc.k3, 
+					rc.k4,
+					rc.kf, 
+					rc.details_json
+				from res_calc rc;
+		end if;
+	
+	exception when others then
+		raise exception 'ERROR: %', sqlerrm;
+				
+	end;
+$function$
+;
+
+-- DROP FUNCTION actuary.get_surrender_value_ul_sps(int4, date);
+
+CREATE OR REPLACE FUNCTION actuary.get_surrender_value_ul_sps(p_contract_id integer, p_calc_date date)
+ RETURNS TABLE(sharer_id integer, s_vykup numeric, s_sr numeric, s_vznos numeric, s_dd numeric, s_mgd numeric, s_vosp numeric, s_vypl numeric, s_perevod numeric, s_finrez numeric, v_sps numeric, k1 numeric, k2 numeric, k3 numeric, k4 numeric, kf numeric, details_json jsonb)
+ LANGUAGE plpgsql
+AS $function$
+	BEGIN
+		return query
+				with recursive base as (
+					select
+						c.id as contract_id,
+						s.id as sharer_id
+					from ourpension.contract c
+					left join ourpension.sharer s on s.contract_id = c.id
+					where c.id = p_contract_id
+						and s.individual_id is null
+				),
+				trans_raw_credit as (
+					select
+						b.contract_id,
+						ot.code as operation_name,
+						at2.mnemonics,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.credit_account_id = a.id
+					join back_office.account_type at2 on at2.id = a.account_type_id
+					join base b on b.contract_id = a.owner_contract_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date <= p_calc_date
+						and ot.code in ('DEPOSIT_ENROLLMENT','DEPOSIT_ENROLLMENT_REFUND',
+										'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+										'REDISTRIBUTION_TO_JOINT_ACCOUNT',
+										'PENSION_INVESTMENT_REVENUE_ENROLLMENT',
+										'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+										'GUARANTEE_ENROLLMENT','GUARANTEE_ENROLLMENT_V')
+						and at2.mnemonics in ('СПС','СПС ИД','СПС ГД','ГВ СПС','ГВЗ СПС')
+					group by b.contract_id, ot.code, at2.mnemonics
+				),
+				trans_raw_debit as (
+					select
+						b.contract_id,
+						ot.code as operation_name,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.debit_account_id = a.id
+					join base b on b.contract_id = a.owner_contract_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date <= p_calc_date
+						and ot.code in ('PAYMENT_PENSION', 'PAYMENT_PENSION_REFUND',
+										'NPO_NDFL_NONSTATE_PENSION','NDFL_PENSION','NDFL_PENSION_REFUND',
+										'PAYMENT_INHERITED','PAYMENT_INHERITED_REFUND',
+										'NDFL_INHERITED','NDFL_INHERITED_REFUND',
+										'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+										'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+										'REDISTRIBUTION_IR_FROM_JOINT_ACCOUNT')
+					group by b.contract_id, ot.code
+				),
+				trans_calc_credit as (	
+					select
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('DEPOSIT_ENROLLMENT',
+											'DEPOSIT_ENROLLMENT_REFUND','REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+											'REDISTRIBUTION_TO_JOINT_ACCOUNT')
+										and trc.mnemonics in ('СПС')) as s_vznos,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('PENSION_INVESTMENT_REVENUE_ENROLLMENT',
+											'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+											'REDISTRIBUTION_TO_JOINT_ACCOUNT')
+										and trc.mnemonics in ('СПС ИД')) as s_dd,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+											'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+											'REDISTRIBUTION_TO_JOINT_ACCOUNT')
+										and trc.mnemonics in ('СПС ГД')) as s_mgd,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('GUARANTEE_ENROLLMENT','GUARANTEE_ENROLLMENT_V')
+										and trc.mnemonics in ('ГВ СПС','ГВЗ СПС')) as s_vosp,
+						trc.contract_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', trc.mnemonics,
+								'amount', trc.trans_amount
+							)
+							order by
+								trc.mnemonics
+						) as credit_included_json
+					from trans_raw_credit trc
+					group by trc.contract_id
+				),
+				trans_calc_debit as (	
+					select
+						sum(trd.trans_amount)
+							filter(where trd.operation_name in ('PAYMENT_PENSION', 'PAYMENT_PENSION_REFUND',
+										'NPO_NDFL_NONSTATE_PENSION','NDFL_PENSION','NDFL_PENSION_REFUND',
+										'PAYMENT_INHERITED','PAYMENT_INHERITED_REFUND',
+										'NDFL_INHERITED','NDFL_INHERITED_REFUND')) as s_vypl,
+						sum(trd.trans_amount)
+							filter(where trd.operation_name in ('REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+										'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+										'REDISTRIBUTION_IR_FROM_JOINT_ACCOUNT')) as s_perevod,
+						trd.contract_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'operation_name', trd.operation_name,
+								'amount', trd.trans_amount
+							)
+							order by trd.operation_name
+						) as debit_included_json
+					from trans_raw_debit trd
+					group by trd.contract_id
+				),
+				not_included_trans_credit as (
+					select
+						b.contract_id,
+						ot.code as operation_name,
+						at2.mnemonics,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.credit_account_id = a.id
+					join back_office.account_type at2 on at2.id = a.account_type_id
+					join base b on b.contract_id = a.owner_contract_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date <= p_calc_date
+						and ot.code not in (select operation_name from trans_raw_credit)
+						and at2.mnemonics not in (select mnemonics from trans_raw_credit)
+					group by b.contract_id, ot.code, at2.mnemonics
+				),
+				not_included_trans_credit_json as (
+					select
+						nit.contract_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', nit.mnemonics,
+								'amount', nit.trans_amount
+							)
+							order by nit.mnemonics
+						) as credit_not_included_json
+					from not_included_trans_credit nit
+					group by nit.contract_id
+				),
+				not_included_trans_debit as (
+					select
+						b.contract_id,
+						ot.code as operation_name,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.debit_account_id = a.id
+					join base b on b.contract_id = a.owner_contract_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date <= p_calc_date
+						and not exists (
+							select 1
+							from trans_raw_debit trd
+							where trd.operation_name = ot.code
+						)
+					group by b.contract_id, ot.code
+				),
+				not_included_trans_debit_json as (
+					select
+						nit.contract_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'operation_name', nit.operation_name,
+								'amount', nit.trans_amount
+							)
+							order by nit.operation_name
+						) as debit_not_included_json
+					from not_included_trans_debit nit
+					group by nit.contract_id
+				),
+				calc_params as (
+					select
+						b.contract_id,
+						coalesce(tcc.s_vznos, 0) as s_vznos,
+						coalesce(tcc.s_dd, 0) as s_dd,
+						coalesce(tcc.s_mgd, 0) as s_mgd,
+						coalesce(tcc.s_vosp, 0) as s_vosp,
+						coalesce(tcd.s_vypl, 0) as s_vypl,
+						coalesce(tcd.s_perevod, 0) as s_perevod,
+						coalesce(tcd.s_vypl, 0) + coalesce(tcd.s_perevod, 0) as s_vypl_per,
+						null::numeric as v_sps
+					from base b
+					left join trans_calc_credit tcc on tcc.contract_id = b.contract_id
+					left join trans_calc_debit tcd on tcd.contract_id = b.contract_id
+				),
+				coeff_params as (
+					select
+						b.contract_id,
+						coalesce(t.k1, 1)::numeric as k1,
+						coalesce(t.k2, 1)::numeric as k2,
+						coalesce(t.k3, 1)::numeric as k3,
+						coalesce(t.k4, 1)::numeric as k4,
+						coalesce(t.kf, 1)::numeric as kf
+					from base b
+					left join lateral (
+						select
+							grc.k1,
+							grc.k2,
+							grc.k3,
+							grc.k4,
+							grc.kf
+						from actuary.get_redemption_coeff(
+							null, '{}'::integer[], 'NPO', p_calc_date, 'Вкладчик', null, b.contract_id
+						) grc
+						where grc.contract_id = b.contract_id
+					) t on true
+				),
+				ost_pre_calc as (
+					select
+						case
+							when trc.operation_name in (
+														'DEPOSIT_ENROLLMENT',
+														'DEPOSIT_ENROLLMENT_REFUND',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('СПС')
+							then 's_vznos'
+							when trc.operation_name in (
+														'PENSION_INVESTMENT_REVENUE_ENROLLMENT',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('СПС ИД')
+							then 's_dd'
+							when trc.operation_name in (
+														'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('СПС ГД')
+							then 's_mgd'
+							when trc.operation_name in (
+														'GUARANTEE_ENROLLMENT',
+														'GUARANTEE_ENROLLMENT_V'
+														)
+								and trc.mnemonics in ('ГВ СПС','ГВЗ СПС')
+							then 's_vosp'
+						end as s_ts,
+						trc.mnemonics,
+						trc.trans_amount,
+						trc.operation_name,
+						trc.contract_id as id
+					from trans_raw_credit trc
+				),
+				calc_ost as (
+					select
+						case
+							when opc.s_ts = 's_vznos' then opc.trans_amount * cp.k1
+							when opc.s_ts = 's_dd' then opc.trans_amount * cp.k2
+							when opc.s_ts = 's_mgd' then opc.trans_amount * cp.k3
+							when opc.s_ts = 's_vosp' then opc.trans_amount * cp.k2
+						end as amount_with_k,
+						opc.s_ts,
+						opc.mnemonics,
+						opc.id
+					from ost_pre_calc opc
+					cross join coeff_params cp
+				),
+				calc_ost_by_type as (
+					select
+						s_ts,
+						sum(amount_with_k) as amount_with_k,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', mnemonics,
+								'amount', amount_with_k
+							)
+							order by id
+						) as mnemonics_json
+					from calc_ost
+					group by s_ts
+				),
+				ost_priority as (
+					select
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						row_number() over (
+							order by
+								case o.s_ts
+									when 's_dd'		then 1
+									when 's_vosp' 	then 2
+									when 's_mgd' 	then 3
+									when 's_vznos'	then 4
+								end
+						) as priority
+					from calc_ost_by_type o
+				),
+				write_off as (
+					select
+						o.priority,
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						cp.s_vypl_per * cp1.k4 as payment_before,
+						least(
+							o.amount_with_k,
+							greatest(cp.s_vypl_per * cp1.k4, 0)
+						) as written_off,
+						greatest(
+							o.amount_with_k
+							-
+							least(
+								o.amount_with_k,
+								greatest(cp.s_vypl_per * cp1.k4, 0)
+							),
+							0
+						) as amount_after,
+						greatest(
+							cp.s_vypl_per * cp1.k4
+							-
+							o.amount_with_k,
+							0
+						) as payment_left
+					from ost_priority o
+					cross join calc_params cp
+					cross join coeff_params cp1
+					where o.priority = 1
+					
+					union all
+					
+					select
+						o.priority,
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						w.payment_left as payment_before,
+						least(
+							o.amount_with_k,
+							greatest(w.payment_left, 0)
+						) as written_off,
+						greatest(
+							o.amount_with_k
+							-
+							least(
+								o.amount_with_k,
+								greatest(w.payment_left, 0)
+							),
+							0
+						) as amount_after,
+						greatest(
+							w.payment_left
+							-
+							o.amount_with_k,
+							0
+						) as payment_left
+					from write_off w
+					join ost_priority o on o.priority = w.priority + 1
+					where w.payment_left > 0
+				),
+				write_off_json as (
+					select
+						coalesce(
+							jsonb_agg(
+								jsonb_build_object(
+									's_ts', 			w.s_ts,
+									'mnemonics', 		w.mnemonics_json,
+									'amount_before', 	w.amount_with_k,
+									'payment_before', 	w.payment_before,
+									'written_off', 		w.written_off,
+									'amount_after', 	w.amount_after,
+									'payment_left',		w.payment_left
+								)
+								order by w.priority
+							),
+							'[]'::jsonb
+						) as write_off_json
+					from write_off w
+				),
+				calc_vykup as (
+					select
+						cp.contract_id,
+						(greatest(0,
+							cp1.k1 * coalesce(cp.s_vznos, 0) +
+							cp1.k2 * (coalesce(cp.s_dd, 0) + coalesce(cp.s_vosp, 0)) +
+							cp1.k3 * coalesce(cp.s_mgd, 0) -
+							cp1.k4 * coalesce(cp.s_vypl, 0) -
+							cp1.k4 * coalesce(cp.s_perevod, 0) + coalesce(cp.v_sps, 0)
+						) * cp1.kf) as s_vykup
+					from calc_params cp
+					join coeff_params cp1 on cp1.contract_id = cp.contract_id
+				),
+				ost as (
+					select
+						bs.contract_id,
+						coalesce(sum(b.total_credit - b.total_debit), 0) as s_ost
+					from back_office.balance b
+					join back_office.account a on b.account_id = a.id
+					left join back_office.account_type at2 on at2.id = a.account_type_id
+					join base bs on bs.contract_id = a.owner_contract_id
+					where b.start_date <= p_calc_date
+						and b.end_date >= p_calc_date
+					group by bs.contract_id
+				),
+				calc_ostatok as (
+					select
+						o.contract_id,
+						(o.s_ost - cv.s_vykup)::numeric as s_sr
+					from ost o
+					join calc_vykup cv on cv.contract_id = o.contract_id
+				)
+				select
+					b.sharer_id,
+					cv.s_vykup,
+					co.s_sr,
+					cp.s_vznos,
+					cp.s_dd,
+					cp.s_mgd,
+					cp.s_vosp,
+					cp.s_vypl,
+					cp.s_perevod,
+					null::numeric as s_finrez,
+					cp.v_sps,
+					cp1.k1,
+					cp1.k2,
+					cp1.k3,
+					cp1.k4,
+					cp1.kf,
+					jsonb_build_object(
+						'credit_included',
+						coalesce(tcc.credit_included_json, '[]'::jsonb),
+						'credit_not_included',
+						coalesce(nitcj.credit_not_included_json, '[]'::jsonb),
+						
+						'debit_included',
+						coalesce(tcd.debit_included_json, '[]'::jsonb),
+						'debit_not_included',
+						coalesce(nitdj.debit_not_included_json, '[]'::jsonb),
+						'write_off',
+						woj.write_off_json,
+						'is_ul',
+						true
+					)::jsonb as details_json
+				from base b
+				left join calc_params cp on cp.contract_id = b.contract_id
+				left join calc_vykup cv on cv.contract_id = b.contract_id
+				left join trans_calc_credit tcc on tcc.contract_id = b.contract_id
+				left join trans_calc_debit tcd on tcd.contract_id = b.contract_id
+				left join not_included_trans_credit_json nitcj on nitcj.contract_id = b.contract_id
+				left join not_included_trans_debit_json nitdj on nitdj.contract_id = b.contract_id
+				left join calc_ostatok co on co.contract_id = b.contract_id
+				left join coeff_params cp1 on cp1.contract_id = b.contract_id
+				cross join write_off_json woj;
+			
+		exception when others then
+			raise exception 'ERROR: %', sqlerrm;
+	END;
+$function$
+;
+
+
+-- DROP FUNCTION actuary.get_surrender_sps(_int4, date);
+
+CREATE OR REPLACE FUNCTION actuary.get_surrender_sps(p_sharer_ids integer[], p_calc_date date)
+ RETURNS TABLE(sharer_id integer, s_vykup numeric, s_sr numeric, s_vznos numeric, s_dd numeric, s_mgd numeric, s_vosp numeric, s_vypl numeric, s_perevod numeric, s_finrez numeric, v_sps numeric, k1 numeric, k2 numeric, k3 numeric, k4 numeric, kf numeric, details_json jsonb)
+ LANGUAGE plpgsql
+AS $function$
+	begin
+			return query
+				with recursive base as (
+					select
+						c.id as contract_id,
+						s.id as sharer_id,
+						per_pens.short_name as pension_type
+					from ourpension.contract c
+					join ourpension.sharer s on s.contract_id = c.id
+					left join lateral(
+						select distinct on (pc.sharer_id)
+							ndpt.short_name
+						from back_office.pension_calculation pc
+						join ourpension.npo_decision_payment_type ndpt 
+							on ndpt.code = pc.npo_decision_payment_type_code
+						where pc.sharer_id = s.id
+						order by pc.sharer_id, pc.calculation_date desc
+					) per_pens on true
+					where s.id = any(p_sharer_ids)
+				),
+				first_date_vp as (
+					select
+						b.contract_id,
+						ssh.status_date as min_vp_date
+					from base b
+					join ourpension.sharer_statuses_history ssh on b.sharer_id = ssh.sharer_id
+					where ssh.id = 1
+					order by ssh.status_date
+					limit 1
+				),
+				trans_raw_credit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						at2.mnemonics,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.credit_account_id = a.id
+					join back_office.account_type at2 on at2.id = a.account_type_id
+					join base b on b.sharer_id = a.owner_sharer_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					cross join first_date_vp fdv
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code in ('DEPOSIT_ENROLLMENT','DEPOSIT_ENROLLMENT_REFUND',
+										'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT','REDISTRIBUTION_TO_JOINT_ACCOUNT',
+										'PENSION_INVESTMENT_REVENUE_ENROLLMENT',
+										'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+										'GUARANTEE_ENROLLMENT','GUARANTEE_ENROLLMENT_V')
+						and at2.mnemonics in ('СПС','СПС ИД','СПС ГД','ГВ СПС','ГВЗ СПС')
+					group by b.sharer_id, ot.code, at2.mnemonics
+				),
+				trans_raw_debit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.debit_account_id = a.id
+					join base b on b.sharer_id = a.owner_sharer_id
+					cross join first_date_vp fdv
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code in ('PAYMENT_PENSION', 'PAYMENT_PENSION_REFUND',
+										'NPO_NDFL_NONSTATE_PENSION','NDFL_PENSION','NDFL_PENSION_REFUND',
+										'PAYMENT_INHERITED','PAYMENT_INHERITED_REFUND',
+										'NDFL_INHERITED','NDFL_INHERITED_REFUND',
+										'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+										'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+										'REDISTRIBUTION_IR_FROM_JOINT_ACCOUNT')
+					group by b.sharer_id, ot.code
+				),
+				trans_calc_credit as (	
+					select
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('DEPOSIT_ENROLLMENT',
+											'DEPOSIT_ENROLLMENT_REFUND','REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+											'REDISTRIBUTION_TO_JOINT_ACCOUNT')
+										and trc.mnemonics in ('СПС')) as s_vznos,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('PENSION_INVESTMENT_REVENUE_ENROLLMENT',
+											'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+											'REDISTRIBUTION_TO_JOINT_ACCOUNT')
+										and trc.mnemonics in ('СПС ИД')) as s_dd,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+											'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+											'REDISTRIBUTION_TO_JOINT_ACCOUNT')
+										and trc.mnemonics in ('СПС ГД')) as s_mgd,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('GUARANTEE_ENROLLMENT','GUARANTEE_ENROLLMENT_V')
+										and trc.mnemonics in ('ГВ СПС','ГВЗ СПС')) as s_vosp,
+						trc.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', trc.mnemonics,
+								'amount', trc.trans_amount
+							)
+							order by
+								trc.mnemonics
+						) as credit_included_json
+					from trans_raw_credit trc
+					group by trc.sharer_id
+				),
+				trans_calc_debit as (	
+					select
+						sum(trd.trans_amount)
+							filter(where trd.operation_name in ('PAYMENT_PENSION', 'PAYMENT_PENSION_REFUND',
+										'NPO_NDFL_NONSTATE_PENSION','NDFL_PENSION','NDFL_PENSION_REFUND',
+										'PAYMENT_INHERITED','PAYMENT_INHERITED_REFUND',
+										'NDFL_INHERITED','NDFL_INHERITED_REFUND')) as s_vypl,
+						sum(trd.trans_amount)
+							filter(where trd.operation_name in ('REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+										'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+										'REDISTRIBUTION_IR_FROM_JOINT_ACCOUNT')) as s_perevod,
+						trd.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'operation_name', trd.operation_name,
+								'amount', trd.trans_amount
+							)
+							order by trd.operation_name
+						) as debit_included_json
+					from trans_raw_debit trd
+					group by trd.sharer_id
+				),
+				not_included_trans_credit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						at2.mnemonics,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.credit_account_id = a.id
+					join back_office.account_type at2 on at2.id = a.account_type_id
+					join base b on b.sharer_id = a.owner_sharer_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					cross join first_date_vp fdv
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code not in (select operation_name from trans_raw_credit)
+						and at2.mnemonics not in (select mnemonics from trans_raw_credit)
+					group by b.sharer_id, ot.code, at2.mnemonics
+				),
+				not_included_trans_credit_json as (
+					select
+						nit.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', nit.mnemonics,
+								'amount', nit.trans_amount
+							)
+							order by nit.mnemonics
+						) as credit_not_included_json
+					from not_included_trans_credit nit
+					group by nit.sharer_id
+				),
+				not_included_trans_debit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.debit_account_id = a.id
+					join base b on b.sharer_id = a.owner_sharer_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					cross join first_date_vp fdv
+					where t.effective_date between fdv.min_vp_date and p_calc_date 
+						and not exists (
+							select 1
+							from trans_raw_debit trd
+							where trd.operation_name = ot.code
+						)
+					group by b.sharer_id, ot.code
+				),
+				not_included_trans_debit_json as (
+					select
+						nit.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'operation_name', nit.operation_name,
+								'amount', nit.trans_amount
+							)
+							order by nit.operation_name
+						) as debit_not_included_json
+					from not_included_trans_debit nit
+					group by nit.sharer_id
+				),
+				calc_v_sps as (
+					select
+						cpl.sharer_id,
+						cpl.value
+					from base b
+					join lateral (
+						select
+							c.sharer_id,
+							c.value
+						from actuary.calc_pension_liabilities(b.sharer_id, p_calc_date, b.pension_type) c
+						where c.sharer_id = b.sharer_id
+					) cpl on true
+					where b.pension_type is not null
+				),
+				calc_params as (
+					select
+						b.sharer_id,
+						coalesce(tcc.s_vznos, 0) as s_vznos,
+						coalesce(tcc.s_dd, 0) as s_dd,
+						coalesce(tcc.s_mgd, 0) as s_mgd,
+						coalesce(tcc.s_vosp, 0) as s_vosp,
+						coalesce(tcd.s_vypl, 0) as s_vypl,
+						coalesce(tcd.s_perevod, 0) as s_perevod,
+						coalesce(tcd.s_vypl, 0) + coalesce(tcd.s_perevod, 0) as s_vypl_per,
+						coalesce(cvs.value, 0) as v_sps
+					from base b
+					left join calc_v_sps cvs on cvs.sharer_id = b.sharer_id
+					left join trans_calc_credit tcc on tcc.sharer_id = b.sharer_id
+					left join trans_calc_debit tcd on tcd.sharer_id = b.sharer_id
+				),
+				coeff_params as (
+					select
+						b.sharer_id,
+						coalesce(t.k1, 1)::numeric as k1,
+						coalesce(t.k2, 1)::numeric as k2,
+						coalesce(t.k3, 1)::numeric as k3,
+						coalesce(t.k4, 1)::numeric as k4,
+						coalesce(t.kf, 1)::numeric as kf
+					from base b
+					left join lateral (
+						select
+							grc.k1,
+							grc.k2,
+							grc.k3,
+							grc.k4,
+							grc.kf
+						from actuary.get_redemption_coeff(
+							null, p_sharer_ids, 'NPO', p_calc_date, 'Участник', null, null
+						) grc
+						where grc.sharer_id = b.sharer_id
+					) t on true
+				),
+				ost_pre_calc as (
+					select
+						case
+							when trc.operation_name in (
+														'DEPOSIT_ENROLLMENT',
+														'DEPOSIT_ENROLLMENT_REFUND',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('СПС')
+							then 's_vznos'
+							when trc.operation_name in (
+														'PENSION_INVESTMENT_REVENUE_ENROLLMENT',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('СПС ИД')
+							then 's_dd'
+							when trc.operation_name in (
+														'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('СПС ГД')
+							then 's_mgd'
+							when trc.operation_name in (
+														'GUARANTEE_ENROLLMENT',
+														'GUARANTEE_ENROLLMENT_V'
+														)
+								and trc.mnemonics in ('ГВ СПС','ГВЗ СПС')
+							then 's_vosp'
+						end as s_ts,
+						trc.mnemonics,
+						trc.trans_amount,
+						trc.operation_name,
+						trc.sharer_id as id
+					from trans_raw_credit trc
+				),
+				calc_ost as (
+					select
+						case
+							when opc.s_ts = 's_vznos' then opc.trans_amount * cp.k1
+							when opc.s_ts = 's_dd' then opc.trans_amount * cp.k2
+							when opc.s_ts = 's_mgd' then opc.trans_amount * cp.k3
+							when opc.s_ts = 's_vosp' then opc.trans_amount * cp.k2
+						end as amount_with_k,
+						opc.s_ts,
+						opc.mnemonics,
+						opc.id
+					from ost_pre_calc opc
+					cross join coeff_params cp
+				),
+				calc_ost_by_type as (
+					select
+						s_ts,
+						sum(amount_with_k) as amount_with_k,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', mnemonics,
+								'amount', amount_with_k
+							)
+							order by id
+						) as mnemonics_json
+					from calc_ost
+					group by s_ts
+				),
+				ost_priority as (
+					select
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						row_number() over (
+							order by
+								case o.s_ts
+									when 's_dd'		then 1
+									when 's_vosp' 	then 2
+									when 's_mgd' 	then 3
+									when 's_vznos'	then 4
+								end
+						) as priority
+					from calc_ost_by_type o
+				),
+				write_off as (
+					select
+						o.priority,
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						cp.s_vypl_per * cp1.k4 as payment_before,
+						least(
+							o.amount_with_k,
+							greatest(cp.s_vypl_per * cp1.k4, 0)
+						) as written_off,
+						greatest(
+							o.amount_with_k
+							-
+							least(
+								o.amount_with_k,
+								greatest(cp.s_vypl_per * cp1.k4, 0)
+							),
+							0
+						) as amount_after,
+						greatest(
+							cp.s_vypl_per * cp1.k4
+							-
+							o.amount_with_k,
+							0
+						) as payment_left
+					from ost_priority o
+					cross join calc_params cp
+					cross join coeff_params cp1
+					where o.priority = 1
+					
+					union all
+					
+					select
+						o.priority,
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						w.payment_left as payment_before,
+						least(
+							o.amount_with_k,
+							greatest(w.payment_left, 0)
+						) as written_off,
+						greatest(
+							o.amount_with_k
+							-
+							least(
+								o.amount_with_k,
+								greatest(w.payment_left, 0)
+							),
+							0
+						) as amount_after,
+						greatest(
+							w.payment_left
+							-
+							o.amount_with_k,
+							0
+						) as payment_left
+					from write_off w
+					join ost_priority o on o.priority = w.priority + 1
+					where w.payment_left > 0
+				),
+				write_off_json as (
+					select
+						coalesce(
+							jsonb_agg(
+								jsonb_build_object(
+									's_ts', 			w.s_ts,
+									'mnemonics', 		w.mnemonics_json,
+									'amount_before', 	w.amount_with_k,
+									'payment_before', 	w.payment_before,
+									'written_off', 		w.written_off,
+									'amount_after', 	w.amount_after,
+									'payment_left',		w.payment_left
+								)
+								order by w.priority
+							),
+							'[]'::jsonb
+						) as write_off_json
+					from write_off w
+				),
+				calc_vykup as (
+					select
+						cp.sharer_id,
+						(greatest(0,
+							cp1.k1 * coalesce(cp.s_vznos, 0) +
+							cp1.k2 * (coalesce(cp.s_dd, 0) + coalesce(cp.s_vosp, 0)) +
+							cp1.k3 * coalesce(cp.s_mgd, 0) -
+							cp1.k4 * coalesce(cp.s_vypl, 0) -
+							cp1.k4 * coalesce(cp.s_perevod, 0) + coalesce(cp.v_sps, 0)
+						) * cp1.kf) as s_vykup
+					from calc_params cp
+					join coeff_params cp1 on cp1.sharer_id = cp.sharer_id
+				),
+				ost as (
+					select
+						bs.sharer_id,
+						coalesce(sum(b.total_credit - b.total_debit), 0) as s_ost
+					from back_office.balance b
+					join back_office.account a on b.account_id = a.id
+					left join back_office.account_type at2 on at2.id = a.account_type_id
+					join base bs on bs.sharer_id = a.owner_sharer_id
+					where b.start_date <= p_calc_date
+						and b.end_date >= p_calc_date
+					group by bs.sharer_id
+				),
+				calc_ostatok as (
+					select
+						o.sharer_id,
+						(o.s_ost - cv.s_vykup)::numeric as s_sr
+					from ost o
+					join calc_vykup cv on cv.sharer_id = o.sharer_id
+				)
+				select
+					b.sharer_id,
+					cv.s_vykup,
+					co.s_sr,
+					cp.s_vznos,
+					cp.s_dd,
+					cp.s_mgd,
+					cp.s_vosp,
+					cp.s_vypl,
+					cp.s_perevod,
+					null::numeric as s_finrez,
+					cp.v_sps,
+					cp1.k1,
+					cp1.k2,
+					cp1.k3,
+					cp1.k4,
+					cp1.kf,
+					jsonb_build_object(
+						'credit_included',
+						coalesce(tcc.credit_included_json, '[]'::jsonb),
+						'credit_not_included',
+						coalesce(nitcj.credit_not_included_json, '[]'::jsonb),
+						
+						'debit_included',
+						coalesce(tcd.debit_included_json, '[]'::jsonb),
+						'debit_not_included',
+						coalesce(nitdj.debit_not_included_json, '[]'::jsonb),
+						'write_off',
+						woj.write_off_json
+					)::jsonb as details_json
+				from base b
+				left join calc_params cp on cp.sharer_id = b.sharer_id
+				left join calc_vykup cv on cv.sharer_id = b.sharer_id
+				left join trans_calc_credit tcc on tcc.sharer_id = b.sharer_id
+				left join trans_calc_debit tcd on tcd.sharer_id = b.sharer_id
+				left join not_included_trans_credit_json nitcj on nitcj.sharer_id = b.sharer_id
+				left join not_included_trans_debit_json nitdj on nitdj.sharer_id = b.sharer_id
+				left join calc_ostatok co on co.sharer_id = b.sharer_id
+				left join coeff_params cp1 on cp1.sharer_id = b.sharer_id
+				cross join write_off_json woj;
+			
+		exception when others then
+			raise exception 'ERROR: %', sqlerrm;
+			
+	END;
+$function$
+;
+
+-- DROP FUNCTION actuary.get_surrender_kips(_int4, date);
+
+CREATE OR REPLACE FUNCTION actuary.get_surrender_kips(p_sharer_ids integer[], p_calc_date date)
+ RETURNS TABLE(sharer_id integer, s_vykup numeric, s_sr numeric, s_vznos numeric, s_dd numeric, s_mgd numeric, s_vosp numeric, s_vypl numeric, s_perevod numeric, s_finrez numeric, v_sps numeric, k1 numeric, k2 numeric, k3 numeric, k4 numeric, kf numeric, details_json jsonb)
+ LANGUAGE plpgsql
+AS $function$
+	begin
+			return query
+				with recursive base as (
+					select
+						s.contract_id,
+						s.id as sharer_id
+					from ourpension.sharer s
+					where s.id = any(p_sharer_ids)
+				),
+				first_date_vp as (
+					select
+						b.contract_id,
+						ssh.status_date as min_vp_date
+					from base b
+					join ourpension.sharer_statuses_history ssh on b.sharer_id = ssh.sharer_id
+					where ssh.id = 1
+					order by ssh.status_date
+					limit 1
+				),
+				trans_raw_credit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						at2.mnemonics,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.credit_account_id = a.id
+					join back_office.account_type at2 on at2.id = a.account_type_id
+					join base b on b.sharer_id = a.owner_sharer_id
+					cross join first_date_vp fdv
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code in ('DEPOSIT_ENROLLMENT','DEPOSIT_ENROLLMENT_REFUND',
+										'REDISTRIBUTION_FROM_JOINT_ACCOUNT','REDISTRIBUTION',
+										'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+										'GUARANTEE_ENROLLMENT','GUARANTEE_ENROLLMENT_V'
+										)
+						and at2.mnemonics in ('ИПС_ЮЛ','ИПС_ЮЛ_ИД','ИПС_ЮЛ_ГД','ГВ ЮЛ','ГВЗ ЮЛ')
+					group by b.sharer_id, ot.code, at2.mnemonics
+				),
+				trans_raw_debit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.debit_account_id = a.id
+					join base b on b.sharer_id = a.owner_sharer_id
+					cross join first_date_vp fdv
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code in ('PAYMENT_PENSION', 'PAYMENT_PENSION_REFUND',
+										'NPO_NDFL_NONSTATE_PENSION','NDFL_PENSION','NDFL_PENSION_REFUND',
+										'PAYMENT_INHERITED','PAYMENT_INHERITED_REFUND',
+										'NDFL_INHERITED','NDFL_INHERITED_REFUND',
+										'REDISTRIBUTION_IR_TO_JOINT_ACCOUNT',
+										'REDISTRIBUTION','REDISTRIBUTION_IR')
+					group by b.sharer_id, ot.code
+				),
+				trans_calc_credit as (	
+					select
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('DEPOSIT_ENROLLMENT','DEPOSIT_ENROLLMENT_REFUND',
+											'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+											'REDISTRIBUTION')
+										and trc.mnemonics in ('ИПС_ЮЛ')) as s_vznos,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+											'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+											'REDISTRIBUTION')
+										and trc.mnemonics in ('ИПС_ЮЛ_ИД')) as s_dd,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+											'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+											'REDISTRIBUTION')
+										and trc.mnemonics = 'ИПС_ЮЛ_ГД') as s_mgd,
+						sum(trc.trans_amount)
+							filter(where trc.operation_name in ('GUARANTEE_ENROLLMENT','GUARANTEE_ENROLLMENT_V')
+										and trc.mnemonics in ('ГВ ЮЛ','ГВЗ ЮЛ')) as s_vosp,
+						trc.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', trc.mnemonics,
+								'amount', trc.trans_amount
+							)
+							order by trc.mnemonics
+						) as credit_included_json
+					from trans_raw_credit trc
+					group by trc.sharer_id
+				),
+				trans_calc_debit as (	
+					select
+						sum(trd.trans_amount)
+							filter(where trd.operation_name in ('PAYMENT_PENSION', 'PAYMENT_PENSION_REFUND',
+										'NPO_NDFL_NONSTATE_PENSION','NDFL_PENSION','NDFL_PENSION_REFUND',
+										'PAYMENT_INHERITED','PAYMENT_INHERITED_REFUND',
+										'NDFL_INHERITED','NDFL_INHERITED_REFUND')) as s_vypl,
+						sum(trd.trans_amount)
+							filter(where trd.operation_name in ('REDISTRIBUTION_IR_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION','REDISTRIBUTION_IR')) as s_perevod,
+						trd.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'operation_name', trd.operation_name,
+								'amount', trd.trans_amount
+							)
+							order by trd.operation_name
+						) as debit_included_json
+					from trans_raw_debit trd
+					group by trd.sharer_id
+				),
+				not_included_trans_credit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						at2.mnemonics,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.credit_account_id = a.id
+					join back_office.account_type at2 on at2.id = a.account_type_id
+					join base b on b.sharer_id = a.owner_sharer_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					cross join first_date_vp fdv
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code not in (select operation_name from trans_raw_credit)
+						and at2.mnemonics not in (select mnemonics from trans_raw_credit)
+					group by b.sharer_id, ot.code, at2.mnemonics
+				),
+				not_included_trans_credit_json as (
+					select
+						nit.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', nit.mnemonics,
+								'amount', nit.trans_amount
+							)
+							order by nit.mnemonics
+						) as credit_not_included_json
+					from not_included_trans_credit nit
+					group by nit.sharer_id
+				),
+				not_included_trans_debit as (
+					select
+						b.sharer_id,
+						ot.code as operation_name,
+						sum(t.value) as trans_amount
+					from back_office.operation o
+					join back_office.transaction t on o.id = t.operation_id 
+					join back_office.account a on t.debit_account_id = a.id
+					join base b on b.sharer_id = a.owner_sharer_id
+					join back_office.operation_type ot on ot.id = o.operation_type_id
+					cross join first_date_vp fdv
+					where t.effective_date between fdv.min_vp_date and p_calc_date
+						and ot.code not in (select operation_name from trans_raw_debit)
+					group by b.sharer_id, ot.code
+				),
+				not_included_trans_debit_json as (
+					select
+						nit.sharer_id,
+						jsonb_agg(
+							jsonb_build_object(
+								'operation_name', nit.operation_name,
+								'amount', nit.trans_amount
+							)
+							order by nit.operation_name
+						) as debit_not_included_json
+					from not_included_trans_debit nit
+					group by nit.sharer_id
+				),
+				calc_params as (
+					select
+						b.sharer_id,
+						coalesce(tcc.s_vznos, 0) as s_vznos,
+						coalesce(tcc.s_dd, 0) as s_dd,
+						coalesce(tcc.s_mgd, 0) as s_mgd,
+						coalesce(tcc.s_vosp, 0) as s_vosp,
+						coalesce(tcd.s_vypl, 0) as s_vypl,
+						coalesce(tcd.s_perevod, 0) as s_perevod,
+						coalesce(tcd.s_vypl, 0) + coalesce(tcd.s_perevod, 0) as s_vypl_per,
+						null::numeric as v_sps
+					from base b
+					left join trans_calc_credit tcc on tcc.sharer_id = b.sharer_id
+					left join trans_calc_debit tcd on tcd.sharer_id = b.sharer_id
+				),
+				coeff_params as (
+					select
+						b.sharer_id,
+						coalesce(t.k1, 1)::numeric as k1,
+						coalesce(t.k2, 1)::numeric as k2,
+						coalesce(t.k3, 1)::numeric as k3,
+						coalesce(t.k4, 1)::numeric as k4,
+						coalesce(t.kf, 1)::numeric as kf
+					from base b
+					left join lateral (
+						select
+							grc.k1,
+							grc.k2,
+							grc.k3,
+							grc.k4,
+							grc.kf
+						from actuary.get_redemption_coeff(
+							null, p_sharer_ids, 'NPO', p_calc_date, 'Участник', null, null
+						) grc
+						where grc.sharer_id = b.sharer_id
+					) t on true
+				),
+				ost_pre_calc as (
+					select
+						case
+							when trc.operation_name in (
+														'DEPOSIT_ENROLLMENT','DEPOSIT_ENROLLMENT_REFUND',
+														'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+														'REDISTRIBUTION'
+														)
+								and trc.mnemonics in ('ИПС_ЮЛ')
+							then 's_vznos'
+							when trc.operation_name in (
+														'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+														'REDISTRIBUTION_FROM_JOINT_ACCOUNT',
+														'REDISTRIBUTION'
+														)
+								and trc.mnemonics in ('ИПС_ЮЛ_ИД')
+							then 's_dd'
+							when trc.operation_name in (
+														'PENSION_INVESTMENT_REVENUE_ENROLLMENT_PR',
+														'REDISTRIBUTION_FROM_TO_JOINT_ACCOUNT',
+														'REDISTRIBUTION_TO_JOINT_ACCOUNT'
+														)
+								and trc.mnemonics in ('ИПС_ЮЛ_ГД')
+							then 's_mgd'
+							when trc.operation_name in (
+														'GUARANTEE_ENROLLMENT',
+														'GUARANTEE_ENROLLMENT_V'
+														)
+								and trc.mnemonics in ('ГВ ЮЛ','ГВЗ ЮЛ')
+							then 's_vosp'
+						end as s_ts,
+						trc.mnemonics,
+						trc.trans_amount,
+						trc.operation_name,
+						trc.sharer_id
+					from trans_raw_credit trc
+				),
+				calc_ost as (
+					select
+						case
+							when opc.s_ts = 's_vznos' then opc.trans_amount * cp.k1
+							when opc.s_ts = 's_dd' then opc.trans_amount * cp.k2
+							when opc.s_ts = 's_mgd' then opc.trans_amount * cp.k3
+							when opc.s_ts = 's_vosp' then opc.trans_amount * cp.k2
+						end as amount_with_k,
+						opc.s_ts,
+						opc.mnemonics,
+						opc.sharer_id
+					from ost_pre_calc opc
+					join coeff_params cp on opc.sharer_id = cp.sharer_id
+				),
+				calc_ost_by_type as (
+					select
+						c.sharer_id,
+						c.s_ts,
+						sum(c.amount_with_k) as amount_with_k,
+						jsonb_agg(
+							jsonb_build_object(
+								'mnemonics', c.mnemonics,
+								'amount', c.amount_with_k
+							)
+							order by c.sharer_id
+						) as mnemonics_json
+					from calc_ost c
+					group by c.sharer_id, c.s_ts
+				),
+				ost_priority as (
+					select
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						o.sharer_id,
+						row_number() over (
+							partition by o.sharer_id
+							order by
+								case o.s_ts
+									when 's_dd'		then 1
+									when 's_vosp' 	then 2
+									when 's_mgd' 	then 3
+									when 's_vznos'	then 4
+								end
+						) as priority
+					from calc_ost_by_type o
+				),
+				write_off as (
+					select
+						o.sharer_id,
+						o.priority,
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						cp.s_vypl_per * cf.k4 as payment_before,
+						least(
+							o.amount_with_k,
+							greatest(cp.s_vypl_per * cf.k4, 0)
+						) as written_off,
+						greatest(
+							o.amount_with_k
+							-
+							least(
+								o.amount_with_k,
+								greatest(cp.s_vypl_per * cf.k4, 0)
+							),
+							0
+						) * cf.kf as amount_after,
+						greatest(
+							cp.s_vypl_per * cf.k4
+							-
+							o.amount_with_k,
+							0
+						) as payment_left
+					from ost_priority o
+					join calc_params cp on cp.sharer_id = o.sharer_id
+					join coeff_params cf on cf.sharer_id = o.sharer_id
+					where o.priority = 1
+					
+					union all
+					
+					select
+						o.sharer_id,
+						o.priority,
+						o.s_ts,
+						o.amount_with_k,
+						o.mnemonics_json,
+						w.payment_left as payment_before,
+						least(
+							o.amount_with_k,
+							greatest(w.payment_left, 0)
+						) as written_off,
+						greatest(
+							o.amount_with_k
+							-
+							least(
+								o.amount_with_k,
+								greatest(w.payment_left, 0)
+							),
+							0
+						) * cf.kf as amount_after,
+						greatest(
+							w.payment_left
+							-
+							o.amount_with_k,
+							0
+						) as payment_left
+					from write_off w
+					join ost_priority o 
+						on o.sharer_id = w.sharer_id
+						and o.priority = w.priority + 1
+					join coeff_params cf on cf.sharer_id = o.sharer_id
+					where w.payment_left > 0
+				),
+				write_off_json as (
+					select
+						w.sharer_id,
+						coalesce(
+							jsonb_agg(
+								jsonb_build_object(
+									's_ts', 			w.s_ts,
+									'mnemonics', 		w.mnemonics_json,
+									'amount_before', 	w.amount_with_k,
+									'payment_before', 	w.payment_before,
+									'written_off', 		w.written_off,
+									'amount_after', 	w.amount_after,
+									'payment_left',		w.payment_left
+								)
+								order by w.priority
+							),
+							'[]'::jsonb
+						) as write_off_json
+					from write_off w
+					group by w.sharer_id
+				),
+				calc_vykup as (
+					select
+						cp.sharer_id,
+						(greatest(0,
+							cp1.k1 * coalesce(cp.s_vznos, 0) +
+							cp1.k2 * (coalesce(cp.s_dd, 0) + coalesce(cp.s_vosp, 0)) +
+							cp1.k3 * coalesce(cp.s_mgd, 0) -
+							cp1.k4 * coalesce(cp.s_vypl, 0) -
+							cp1.k4 * coalesce(cp.s_perevod, 0) + coalesce(cp.v_sps, 0)
+						) * cp1.kf) as s_vykup
+					from calc_params cp
+					join coeff_params cp1 on cp1.sharer_id = cp.sharer_id
+				),
+				balance_ost as (
+					select
+						bs.sharer_id,
+						coalesce(sum(b.total_credit - b.total_debit), 0) as s_ost
+					from back_office.balance b
+					join back_office.account a on b.account_id = a.id
+					left join back_office.account_type at2 on at2.id = a.account_type_id
+					join base bs on bs.sharer_id = a.owner_sharer_id
+					where b.start_date <= p_calc_date
+						and b.end_date >= p_calc_date
+					group by bs.sharer_id
+				),
+				calc_balance_ost as (
+					select
+						o.sharer_id,
+						(o.s_ost - cv.s_vykup)::numeric as s_sr
+					from balance_ost o
+					join calc_vykup cv on cv.sharer_id = o.sharer_id
+				)
+				select
+					b.sharer_id,
+					cv.s_vykup,
+					co.s_sr,
+					cp.s_vznos,
+					cp.s_dd,
+					cp.s_mgd,
+					cp.s_vosp,
+					cp.s_vypl,
+					cp.s_perevod,
+					null::numeric as s_finrez,
+					cp.v_sps,
+					cp1.k1,
+					cp1.k2,
+					cp1.k3,
+					cp1.k4,
+					cp1.kf,
+					jsonb_build_object(
+						'credit_included',
+						coalesce(tcc.credit_included_json, '[]'::jsonb),
+						'credit_not_included',
+						coalesce(nitcj.credit_not_included_json, '[]'::jsonb),
+						
+						'debit_included',
+						coalesce(tcd.debit_included_json, '[]'::jsonb),
+						'debit_not_included',
+						coalesce(nitdj.debit_not_included_json, '[]'::jsonb),
+						'write_off',
+						woj.write_off_json
+					)::jsonb as details_json
+				from base b
+				left join calc_params cp on cp.sharer_id = b.sharer_id
+				left join calc_vykup cv on cv.sharer_id = b.sharer_id
+				left join trans_calc_credit tcc on tcc.sharer_id = b.sharer_id
+				left join trans_calc_debit tcd on tcd.sharer_id = b.sharer_id
+				left join not_included_trans_credit_json nitcj on nitcj.sharer_id = b.sharer_id
+				left join not_included_trans_debit_json nitdj on nitdj.sharer_id = b.sharer_id
+				left join calc_balance_ost co on co.sharer_id = b.sharer_id
+				left join coeff_params cp1 on cp1.sharer_id = b.sharer_id
+				left join write_off_json woj on woj.sharer_id = b.sharer_id;
+			
+		exception when others then
+			raise exception 'ERROR: %', sqlerrm;
+		
+	end;
+$function$
+;
