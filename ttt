@@ -1,1 +1,262 @@
-1
+-- DROP FUNCTION actuary.get_balance_by_pension_scheme(date, date, text);
+
+CREATE OR REPLACE FUNCTION actuary.get_balance_by_pension_scheme(p_start_date date, p_end_date date, p_service_type text)
+ RETURNS TABLE(date date, scheme_contract text, portfolioinvest text, balancevalue numeric, account_type text, sharer_type text)
+ LANGUAGE plpgsql
+AS $function$
+	declare
+	
+		v_sql text;
+		v_join_contract text;
+		v_contract_field text;
+		v_contract_field2 text;
+	
+	begin
+		
+		--Реализация расчета из процедуры class.listBalanceByDayPDS и class.listBalanceByPortfolioNPO
+		--в НПФ360. av.kharchenko 07.04.2026
+		
+		if p_start_date is null or p_end_date is null then 
+			raise exception 'Inputs dates is NULL';
+		end if;
+	
+		v_sql = format($sql$
+			with base_all as (
+				select
+					(b.total_credit - b.total_debit) as amount,
+					ps.pension_scheme_name as scheme_contract,
+					coalesce(ps.investment_portfolio_name, 'none'::text) as portfolioInvest,
+					case
+			            when sp.sharer_type in ('SPS_U', 'SPS_P', 'SPS')
+			                then 'СПС'::text
+			            when sp.sharer_type in ('KIPS', 'IPS_P', 'IPS')
+			                then 'ИПС'::text
+			            when sp.sharer_type = 'SDS'
+			            	then 'СДС'::text
+		        	end as account_management_form,
+					'ФЛ'::text as SHARER_TYPE,
+					b.start_date,
+					b.end_date
+				from back_office.balance b
+				join back_office.account a on b.account_id = a.id
+				join ourpension.sharer s 
+					on s.id = a.owner_sharer_id
+					and s.individual_id is not null
+				join ourpension.contract c on c.id = s.contract_id
+				join ourpension.sharer_params sp on sp.sharer_id = s.id
+				join lateral (
+					select
+						gps.sharer_id,
+						gps.name as pension_scheme_name,
+						gps.investment_portfolio_name,
+						gps.scheme_rule_name
+					from actuary.get_pension_scheme_for_report(
+						array[s.id]::integer[],
+						'{}'::integer[],
+						$2,
+						$3,
+						$1::text
+					) gps
+					where gps.sharer_id = s.id
+				) ps on true
+				where c.service_type = $1::text
+					and b.start_date <= $3
+					and b.end_date >= $2
+					and ps.investment_portfolio_name = '1-2025_ПДС - КПП'
+					
+				union all
+				
+				select
+					(b.total_credit - b.total_debit) as amount,
+					ps.pension_scheme_name as scheme_contract,
+					coalesce(ps.investment_portfolio_name, 'none'::text) as portfolioInvest,
+					case
+			            when sp.sharer_type in ('SPS_U', 'SPS_P', 'SPS')
+			                then 'СПС'::text
+			            when sp.sharer_type in ('KIPS', 'IPS_P', 'IPS')
+			                then 'ИПС'::text
+			            when sp.sharer_type = 'SDS'
+			            	then 'СДС'::text
+		        	end as account_management_form,
+					'ЮЛ'::text as SHARER_TYPE,
+					b.start_date,
+					b.end_date
+				from back_office.balance b
+				join back_office.account a on b.account_id = a.id
+				join ourpension.contract c on c.id = a.owner_contract_id
+				join ourpension.sharer s 
+					on s.contract_id = c.id
+					and s.individual_id is null
+				join ourpension.sharer_params sp on sp.sharer_id = s.id
+				join lateral (
+					select
+						gps.sharer_id,
+						gps.contract_id,
+						gps.name as pension_scheme_name,
+						gps.investment_portfolio_name,
+						gps.scheme_rule_name
+					from actuary.get_pension_scheme_for_report(
+						array[s.id]::integer[],
+						array[c.id]::integer[],
+						$2,
+						$3,
+						$1::text
+					) gps
+					where gps.sharer_id = s.id
+						and gps.contract_id = c.id
+				) ps on true
+				where c.service_type = $1::text
+					and b.start_date <= $3
+					and b.end_date >= $2
+					and ps.investment_portfolio_name = '1-2025_ПДС - КПП'
+			),
+			initial as (
+				select
+					sum(ba.amount) as delta,
+					ba.scheme_contract,
+					ba.portfolioInvest,
+					ba.account_management_form,
+					ba.SHARER_TYPE,
+					$2::date as dt
+				from base_all ba
+				where ba.start_date <= $2
+					and ba.end_date >= $2
+				group by ba.scheme_contract, ba.portfolioInvest, ba.account_management_form, ba.SHARER_TYPE
+			),
+			starts as (
+				select
+					ba.amount as delta,
+					ba.scheme_contract,
+					ba.portfolioInvest,
+					ba.account_management_form,
+					ba.SHARER_TYPE,
+					ba.start_date as dt
+				from base_all ba
+				where ba.start_date > $2
+					and ba.start_date <= $3
+			),
+			ends as (
+				select
+					-ba.amount as delta,
+					ba.scheme_contract,
+					ba.portfolioInvest,
+					ba.account_management_form,
+					ba.SHARER_TYPE,
+					(ba.end_date + 1)::date as dt
+				from base_all ba
+				where ba.end_date >= $2
+					and ba.end_date < $3
+			),
+			movments as (
+				select * from initial
+				union all
+				select * from starts
+				union all
+				select * from ends
+			),
+			aggregated as (
+				select 
+					m.scheme_contract,
+					m.portfolioInvest,
+					m.account_management_form,
+					m.SHARER_TYPE,
+					m.dt,
+					sum(m.delta) as delta
+				from movments m
+				group by m.dt, m.scheme_contract, m.portfolioInvest, m.account_management_form, m.SHARER_TYPE
+			),
+			running as (
+				select
+					a.scheme_contract,
+					a.portfolioInvest,
+					a.account_management_form,
+					a.SHARER_TYPE,
+					a.dt,
+					sum(a.delta) over(
+						partition by a.scheme_contract, a.portfolioInvest, a.account_management_form, a.SHARER_TYPE
+						order by a.dt
+						rows between unbounded preceding and current row
+					) as balancevalue
+				from aggregated a
+			),
+			date_series as (
+				select generate_series($2, $3, '1 day'::interval)::date as dt
+			),
+			schemes as (
+				select distinct
+					x.scheme_contract,
+					x.portfolioInvest,
+					x.account_management_form,
+					x.SHARER_TYPE
+				from (
+				select i.scheme_contract, i.portfolioInvest, i.account_management_form, i.SHARER_TYPE from initial i
+				UNION
+				select r.scheme_contract, r.portfolioInvest, r.account_management_form, r.SHARER_TYPE from running r
+				) x
+			),
+			expanded as (
+				select
+					ds.dt,
+					sc.scheme_contract,
+					sc.portfolioInvest,
+					r.balancevalue,
+					sc.account_management_form,
+					sc.SHARER_TYPE
+				from date_series ds
+				cross join schemes sc
+				left join running r on r.dt = ds.dt 
+					and r.scheme_contract = sc.scheme_contract
+					and r.portfolioInvest = sc.portfolioInvest
+					and r.account_management_form = sc.account_management_form
+					and r.SHARER_TYPE = sc.SHARER_TYPE
+			),
+			marked as (
+				select
+					e.dt,
+					e.scheme_contract,
+					e.portfolioInvest,
+					e.account_management_form,
+					e.SHARER_TYPE,
+					e.balancevalue,
+					count(e.balancevalue) over (
+						partition by e.scheme_contract, e.portfolioInvest, e.account_management_form, e.SHARER_TYPE
+						order by e.dt
+						rows between unbounded preceding and current row 
+					) as grp
+				from expanded e
+			),
+			filled as (
+				select
+					m.dt,
+					m.scheme_contract,
+					m.portfolioInvest,
+					m.account_management_form,
+					m.SHARER_TYPE,
+					max(m.balancevalue) over (
+						partition by m.scheme_contract, m.portfolioInvest, m.account_management_form, m.SHARER_TYPE, m.grp
+					) as balancevalue
+				from marked m
+			)
+			select
+				f.dt as "date",
+				f.scheme_contract::text,
+				f.portfolioInvest::text,
+				f.balancevalue::numeric,
+				f.account_management_form::text as account_type,
+				f.SHARER_TYPE::text
+			from filled f
+			order by f.scheme_contract, f.dt
+			$sql$
+			);		
+	
+		raise notice '%', v_sql;
+		
+		return query execute v_sql
+			using p_service_type, p_start_date, p_end_date;
+		
+		exception when others then
+			raise exception 'ERROR: %', sqlerrm;	
+	
+	END;
+$function$
+;
