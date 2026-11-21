@@ -1,1 +1,26 @@
-1
+select
+                    pc.period_end_date,
+                    ndpt.short_name,
+                    coalesce(
+                        pcs1.value_pension,
+                        pcs3.value_pension
+                    ) as value_pension,
+                    coalesce(
+                        pcs1.times_in_year,
+                        pcs3.times_in_year
+                    ) as times_in_year
+                from back_office.pension_calculation pc
+                join ourpension.npo_decision_payment_type ndpt on ndpt.code = pc.npo_decision_payment_type_code
+                join back_office.npo_decision_type ndt on ndt.id = pc.npo_decision_type_id
+                left join back_office.pension_calculation_scheme1 pcs1 on pcs1.pension_calculation_id = pc.id
+                left join back_office.pension_calculation_scheme3 pcs3 on pcs3.pension_calculation_id = pc.id
+                where pc.sharer_id = s.id
+                 and pc.calculation_date <= p_end_date
+                 and ndpt.short_name in (
+                     'До исчерпания',
+                     'Срочная',
+                     'Пожизненная'
+                 )
+                 and ndt.code in ('УСТН', 'КОРР')
+                order by pc.calculation_date desc
+                limit 1
