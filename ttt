@@ -1,1 +1,192 @@
-1
+            prev_status.code as previous_status_code,
+            prev_status.status_name as previous_status_name
+        from ourpension.sharer s
+        left join lateral (
+            select
+                ssh.code,
+                ssh.status_date,
+                ssh.id as status_history_id
+            from ourpension.sharer_statuses_history ssh
+            where ssh.sharer_id = s.id
+              and ssh.status_date < v_calc_datetime
+            order by ssh.status_date desc, ssh.id desc
+            limit 1
+        ) ls on true
+        left join ourpension.sharer_statuses ss
+          on ss.code = ls.code
+        -- Для IA0 определяем статус до закрытия, а не «последний GA0/HA0»
+        -- за всю историю. Иначе можно ошибиться с выплатным периодом.
+        left join lateral (
+            select
+                ssh.code,
+                ss0.name as status_name
+            from ourpension.sharer_statuses_history ssh
+            join ourpension.sharer_statuses ss0
+              on ss0.code = ssh.code
+            where ssh.sharer_id = s.id
+              and ls.code = 'IA0'
+              and (ssh.status_date, ssh.id) <
+                  (ls.status_date, ls.status_history_id)
+              and ssh.code <> 'IA0'
+            order by ssh.status_date desc, ssh.id desc
+            limit 1
+        ) prev_status on true
+        where s.id = p_sharer_id
+    ),
+    death_period as (
+        select
+            b.death_date,
+            date_trunc('month', b.death_date)::date as death_month_start,
+            (date_trunc('month', b.death_date) + interval '1 month')::date
+                as death_month_end_exclusive
+        from base b
+    ),
+
+    -- Отдельные записи настроек могут содержать только код операции
+    -- или только мнемонику. Маппинг выполняется в пределах direction + s_ts.
+    settings as materialized (
+        select distinct
+            sc.direction,
+            sc.s_ts,
+            sc.operation_type_code,
+            sc.mnemonics
+        from actuary.settings_for_redemption_calculation sc
+        where sc.service_type = 'NPO'
+          and sc.calculation_type = 'FULL'
+          and sc.direction in ('credit', 'debit')
+          and sc.s_ts in (
+              's_vznos', 's_dd', 's_mgd', 's_vosp',
+              's_vypl', 's_perevod'
+          )
+    ),
+
+    -- Каждую сторону проводок читаем один раз, далее работаем с CTE.
+    trans_all_credit as materialized (
+        select
+            a.owner_sharer_id as id,
+            t.id as transaction_id,
+            o.id as operation_id,
+            ot.code as operation_name,
+            at2.mnemonics,
+            t.effective_date,
+            t.value::numeric as trans_amount,
+            'credit'::text as direction
+        from back_office.transaction t
+        join back_office.operation o on o.id = t.operation_id
+        join back_office.operation_type ot on ot.id = o.operation_type_id
+        join back_office.account a on a.id = t.credit_account_id
+        join back_office.account_type at2 on at2.id = a.account_type_id
+        where a.owner_sharer_id = p_sharer_id
+          and t.effective_date < p_calc_date + 1
+    ),
+    trans_all_debit as materialized (
+        select
+            a.owner_sharer_id as id,
+            t.id as transaction_id,
+            o.id as operation_id,
+            ot.code as operation_name,
+            at2.mnemonics,
+            t.effective_date,
+            t.value::numeric as trans_amount,
+            'debit'::text as direction
+        from back_office.transaction t
+        join back_office.operation o on o.id = t.operation_id
+        join back_office.operation_type ot on ot.id = o.operation_type_id
+        join back_office.account a on a.id = t.debit_account_id
+        join back_office.account_type at2 on at2.id = a.account_type_id
+        where a.owner_sharer_id = p_sharer_id
+          and t.effective_date < p_calc_date + 1
+    ),
+    trans_source as materialized (
+        select * from trans_all_credit
+        union all
+        select * from trans_all_debit
+    ),
+
+    -- БТ: последняя операция TRANSFER_TO_INSURED_FUND_RESERVE,
+    -- после которой счет закрыли, не участвует в расчете.
+    -- Ищем последнюю операцию ДО/В ДЕНЬ закрытия, а не за всю историю:
+    -- после закрытия могли поступить возвраты выкупных сумм.
+    last_operation_before_close as (
+        select
+            t.operation_id,
+            t.operation_name,
+            t.effective_date
+        from trans_source t
+        join base b on b.id = t.id
+        where b.last_status_code = 'IA0'
+          and t.effective_date < b.last_status_date::date + 1
+        order by t.effective_date desc, t.operation_id desc
+        limit 1
+    ),
+    trans_checked as materialized (
+        select
+            t.*,
+            (
+                b.last_status_code = 'IA0'
+                and t.operation_name = 'TRANSFER_TO_INSURED_FUND_RESERVE'
+                and t.operation_id = loc.operation_id
+            ) is true as excluded_final_reserve
+        from trans_source t
+        join base b on b.id = t.id
+        left join last_operation_before_close loc on true
+    ),
+
+    -- В settings_for_redemption_calculation код операции и мнемоника
+    -- взаимоисключающие: одна строка настройки содержит один из двух ключей.
+    -- Поэтому сопоставляем OPERATION OR MNEMONICS в пределах direction+s_ts.
+    -- При совпадении разных s_ts сохраняем диагностику (см. ниже).
+    trans_mapped as materialized (
+        select
+            t.id,
+            t.transaction_id,
+            t.operation_id,
+            t.operation_name,
+            t.mnemonics,
+            t.effective_date,
+            t.trans_amount,
+            t.direction,
+            st.s_ts
+        from trans_checked t
+        cross join (
+            values
+                ('s_vznos'::text),
+                ('s_dd'::text),
+                ('s_mgd'::text),
+                ('s_vosp'::text),
+                ('s_vypl'::text),
+                ('s_perevod'::text)
+        ) st(s_ts)
+        where not t.excluded_final_reserve
+          and exists (
+              select 1
+              from settings sc
+              where sc.direction = t.direction
+                and sc.s_ts = st.s_ts
+                and (
+                    (sc.operation_type_code is not null
+                     and sc.operation_type_code = t.operation_name)
+                    or
+                    (sc.mnemonics is not null
+                     and sc.mnemonics = t.mnemonics)
+                )
+          )
+    ),
+
+    -- Включенная транзакция в JSON должна присутствовать ОДИН раз,
+    -- даже если настройки допускают несколько классификаций s_ts.
+    trans_included as materialized (
+        select t.*
+        from trans_checked t
+        where not t.excluded_final_reserve
+          and exists (
+              select 1
+              from trans_mapped m
+              where m.transaction_id = t.transaction_id
+                and m.direction = t.direction
+          )
+    ),
+    trans_not_included as materialized (
+        select t.*
+        from trans_checked t
+        where t.excluded_final_reserve
