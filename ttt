@@ -1,1 +1,1007 @@
-1
+-- Ветка actuary.get_surrender_value: выкупная сумма правопреемникам по НПО.
+-- Предполагается существующий контекст функции:
+-- p_sharer_id, p_individual_id, p_calc_date, v_calc_datetime,
+-- v_service_type, v_is_nonstandard, v_round_type.
+-- ВАЖНО: признак закрытия = последний статус IA0.
+-- Стадия счета определяется через наименование в sharer_statuses;
+-- при IA0 используется ПРЕДЫДУЩИЙ незакрытый статус.
+-- Если имя не содержит «накоп» или «выплат», нужна проверка соответствий в БД.
+-- Параметры inheritance_on_pay / inheritance_on_accum получаем из
+-- get_redemption_coeff; допускаются массивы текстовых/булевых значений.
+-- Дата смерти: заменить NULL::date в CTE base своим источником.
+-- Для периодизации выплат пока используется t.effective_date как ВРЕМЕННЫЙ
+-- ориентир. Если это дата проводки, а не месяц начисления пенсии, замените
+-- t.effective_date::date в pension_payment_period на реальный период выплаты.
+-- Без истории назначенной пенсии/приостановки точная задолженность не считается.
+-- Показатели pension_settlement ниже — диагностика, не финансовый итог.
+
+if (v_service_type = 'NPO' and p_individual_id is not null)
+   and v_is_nonstandard = false then
+
+    return query
+    with recursive
+    base as (
+        select
+            s.id,
+            s.contract_id,
+            -- TODO: ЗАМЕНИТЬ на дату смерти из входных данных / JOIN выше.
+            -- Это единственное место, где нужно подставить реальное поле.
+            null::date as death_date,
+            ls.code as last_status_code,
+            ls.status_date as last_status_date,
+            ss.name as last_status_name,
+            prev_status.code as previous_status_code,
+            prev_status.status_name as previous_status_name
+        from ourpension.sharer s
+        left join lateral (
+            select
+                ssh.code,
+                ssh.status_date,
+                ssh.id as status_history_id
+            from ourpension.sharer_statuses_history ssh
+            where ssh.sharer_id = s.id
+              and ssh.status_date < v_calc_datetime
+            order by ssh.status_date desc, ssh.id desc
+            limit 1
+        ) ls on true
+        left join ourpension.sharer_statuses ss
+          on ss.code = ls.code
+        -- Для IA0 определяем статус до закрытия, а не «последний GA0/HA0»
+        -- за всю историю. Иначе можно ошибиться с выплатным периодом.
+        left join lateral (
+            select
+                ssh.code,
+                ss0.name as status_name
+            from ourpension.sharer_statuses_history ssh
+            join ourpension.sharer_statuses ss0
+              on ss0.code = ssh.code
+            where ssh.sharer_id = s.id
+              and ls.code = 'IA0'
+              and (ssh.status_date, ssh.id) <
+                  (ls.status_date, ls.status_history_id)
+              and ssh.code <> 'IA0'
+            order by ssh.status_date desc, ssh.id desc
+            limit 1
+        ) prev_status on true
+        where s.id = p_sharer_id
+    ),
+    death_period as (
+        select
+            b.death_date,
+            date_trunc('month', b.death_date)::date as death_month_start,
+            (date_trunc('month', b.death_date) + interval '1 month')::date
+                as death_month_end_exclusive
+        from base b
+    ),
+
+    -- Отдельные записи настроек могут содержать только код операции
+    -- или только мнемонику. Маппинг выполняется в пределах direction + s_ts.
+    settings as materialized (
+        select distinct
+            sc.direction,
+            sc.s_ts,
+            sc.operation_type_code,
+            sc.mnemonics
+        from actuary.settings_for_redemption_calculation sc
+        where sc.service_type = 'NPO'
+          and sc.calculation_type = 'FULL'
+          and sc.direction in ('credit', 'debit')
+          and sc.s_ts in (
+              's_vznos', 's_dd', 's_mgd', 's_vosp',
+              's_vypl', 's_perevod'
+          )
+    ),
+
+    -- Каждую сторону проводок читаем один раз, далее работаем с CTE.
+    trans_all_credit as materialized (
+        select
+            a.owner_sharer_id as id,
+            t.id as transaction_id,
+            o.id as operation_id,
+            ot.code as operation_name,
+            at2.mnemonics,
+            t.effective_date,
+            t.value::numeric as trans_amount,
+            'credit'::text as direction
+        from back_office.transaction t
+        join back_office.operation o on o.id = t.operation_id
+        join back_office.operation_type ot on ot.id = o.operation_type_id
+        join back_office.account a on a.id = t.credit_account_id
+        join back_office.account_type at2 on at2.id = a.account_type_id
+        where a.owner_sharer_id = p_sharer_id
+          and t.effective_date < p_calc_date + 1
+    ),
+    trans_all_debit as materialized (
+        select
+            a.owner_sharer_id as id,
+            t.id as transaction_id,
+            o.id as operation_id,
+            ot.code as operation_name,
+            at2.mnemonics,
+            t.effective_date,
+            t.value::numeric as trans_amount,
+            'debit'::text as direction
+        from back_office.transaction t
+        join back_office.operation o on o.id = t.operation_id
+        join back_office.operation_type ot on ot.id = o.operation_type_id
+        join back_office.account a on a.id = t.debit_account_id
+        join back_office.account_type at2 on at2.id = a.account_type_id
+        where a.owner_sharer_id = p_sharer_id
+          and t.effective_date < p_calc_date + 1
+    ),
+    trans_source as materialized (
+        select * from trans_all_credit
+        union all
+        select * from trans_all_debit
+    ),
+
+    -- БТ: последняя операция TRANSFER_TO_INSURED_FUND_RESERVE,
+    -- после которой счет закрыли, не участвует в расчете.
+    -- Ищем последнюю операцию ДО/В ДЕНЬ закрытия, а не за всю историю:
+    -- после закрытия могли поступить возвраты выкупных сумм.
+    last_operation_before_close as (
+        select
+            t.operation_id,
+            t.operation_name,
+            t.effective_date
+        from trans_source t
+        join base b on b.id = t.id
+        where b.last_status_code = 'IA0'
+          and t.effective_date < b.last_status_date::date + 1
+        order by t.effective_date desc, t.operation_id desc
+        limit 1
+    ),
+    trans_checked as materialized (
+        select
+            t.*,
+            (
+                b.last_status_code = 'IA0'
+                and t.operation_name = 'TRANSFER_TO_INSURED_FUND_RESERVE'
+                and t.operation_id = loc.operation_id
+            ) is true as excluded_final_reserve
+        from trans_source t
+        join base b on b.id = t.id
+        left join last_operation_before_close loc on true
+    ),
+
+    -- В settings_for_redemption_calculation код операции и мнемоника
+    -- взаимоисключающие: одна строка настройки содержит один из двух ключей.
+    -- Поэтому сопоставляем OPERATION OR MNEMONICS в пределах direction+s_ts.
+    -- При совпадении разных s_ts сохраняем диагностику (см. ниже).
+    trans_mapped as materialized (
+        select
+            t.id,
+            t.transaction_id,
+            t.operation_id,
+            t.operation_name,
+            t.mnemonics,
+            t.effective_date,
+            t.trans_amount,
+            t.direction,
+            st.s_ts
+        from trans_checked t
+        cross join (
+            values
+                ('s_vznos'::text),
+                ('s_dd'::text),
+                ('s_mgd'::text),
+                ('s_vosp'::text),
+                ('s_vypl'::text),
+                ('s_perevod'::text)
+        ) st(s_ts)
+        where not t.excluded_final_reserve
+          and exists (
+              select 1
+              from settings sc
+              where sc.direction = t.direction
+                and sc.s_ts = st.s_ts
+                and (
+                    (sc.operation_type_code is not null
+                     and sc.operation_type_code = t.operation_name)
+                    or
+                    (sc.mnemonics is not null
+                     and sc.mnemonics = t.mnemonics)
+                )
+          )
+    ),
+
+    -- Включенная транзакция в JSON должна присутствовать ОДИН раз,
+    -- даже если настройки допускают несколько классификаций s_ts.
+    trans_included as materialized (
+        select t.*
+        from trans_checked t
+        where not t.excluded_final_reserve
+          and exists (
+              select 1
+              from trans_mapped m
+              where m.transaction_id = t.transaction_id
+                and m.direction = t.direction
+          )
+    ),
+    trans_not_included as materialized (
+        select t.*
+        from trans_checked t
+        where t.excluded_final_reserve
+           or not exists (
+               select 1
+               from trans_mapped m
+               where m.transaction_id = t.transaction_id
+                 and m.direction = t.direction
+           )
+    ),
+
+    -- Знаки в точности соответствуют исходной ветке:
+    -- суммы остатков: credit +, debit -;
+    -- выплаты/переводы: credit -, debit +.
+    trans_amounts as (
+        select
+            m.*,
+            case
+                when m.s_ts in ('s_vznos', 's_dd', 's_mgd', 's_vosp')
+                    then case when m.direction = 'credit'
+                              then m.trans_amount else -m.trans_amount end
+                else case when m.direction = 'credit'
+                          then -m.trans_amount else m.trans_amount end
+            end as signed_amount
+        from trans_mapped m
+    ),
+    trans_calc_credit as (
+        select
+            id,
+            sum(signed_amount) filter (where s_ts = 's_vznos') as s_vznos,
+            sum(signed_amount) filter (where s_ts = 's_dd') as s_dd,
+            sum(signed_amount) filter (where s_ts = 's_mgd') as s_mgd,
+            sum(signed_amount) filter (where s_ts = 's_vosp') as s_vosp,
+            sum(signed_amount) filter (where s_ts = 's_vypl') as s_vypl,
+            sum(signed_amount) filter (where s_ts = 's_perevod') as s_perevod
+        from trans_amounts
+        where direction = 'credit'
+        group by id
+    ),
+    trans_calc_debit as (
+        select
+            id,
+            sum(signed_amount) filter (where s_ts = 's_vznos') as s_vznos,
+            sum(signed_amount) filter (where s_ts = 's_dd') as s_dd,
+            sum(signed_amount) filter (where s_ts = 's_mgd') as s_mgd,
+            sum(signed_amount) filter (where s_ts = 's_vosp') as s_vosp,
+            sum(signed_amount) filter (where s_ts = 's_vypl') as s_vypl,
+            sum(signed_amount) filter (where s_ts = 's_perevod') as s_perevod
+        from trans_amounts
+        where direction = 'debit'
+        group by id
+    ),
+    trans_included_json as (
+        select
+            id,
+            coalesce(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'operation_name', operation_name,
+                        'mnemonics', mnemonics,
+                        'amount', trans_amount
+                    ) order by operation_name, mnemonics
+                ) filter (where direction = 'credit'),
+                '[]'::jsonb
+            ) as credit_included_json,
+            coalesce(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'operation_name', operation_name,
+                        'mnemonics', mnemonics,
+                        'amount', trans_amount
+                    ) order by operation_name, mnemonics
+                ) filter (where direction = 'debit'),
+                '[]'::jsonb
+            ) as debit_included_json
+        from (
+            select
+                id,
+                direction,
+                operation_name,
+                mnemonics,
+                sum(trans_amount) as trans_amount
+            from trans_included
+            group by id, direction, operation_name, mnemonics
+        ) a
+        group by id
+    ),
+    trans_not_included_json as (
+        select
+            id,
+            coalesce(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'operation_name', operation_name,
+                        'mnemonics', mnemonics,
+                        'amount', trans_amount,
+                        'reason', case
+                            when excluded_final_reserve
+                                then 'FINAL_TRANSFER_TO_INSURED_FUND_RESERVE'
+                            else 'NOT_MAPPED'
+                        end
+                    ) order by operation_name, mnemonics
+                ) filter (where direction = 'credit'),
+                '[]'::jsonb
+            ) as credit_not_included_json,
+            coalesce(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'operation_name', operation_name,
+                        'mnemonics', mnemonics,
+                        'amount', trans_amount,
+                        'reason', case
+                            when excluded_final_reserve
+                                then 'FINAL_TRANSFER_TO_INSURED_FUND_RESERVE'
+                            else 'NOT_MAPPED'
+                        end
+                    ) order by operation_name, mnemonics
+                ) filter (where direction = 'debit'),
+                '[]'::jsonb
+            ) as debit_not_included_json
+        from (
+            select
+                id,
+                direction,
+                operation_name,
+                mnemonics,
+                excluded_final_reserve,
+                sum(trans_amount) as trans_amount
+            from trans_not_included
+            group by id, direction, operation_name, mnemonics, excluded_final_reserve
+        ) a
+        group by id
+    ),
+
+    successors_share as (
+        select
+            s.id,
+            a.d
+        from ourpension.sharer s
+        left join lateral (
+            select
+                ip.share_numerator::numeric /
+                    nullif(ip.share_denominator::numeric, 0) as d
+            from ourpension.inherited_payment ip
+            left join ourpension.inherited_payment_data ipd
+                on ipd.inherited_payment_id = ip.id
+            where s.id = coalesce(ipd.sharer_id, ip.sharer_id)
+              and ip.inheritor_id = p_individual_id
+              and ip."date" <= p_calc_date
+            order by ip."date" desc, ip.id desc
+            limit 1
+        ) a on true
+        where s.id = p_sharer_id
+    ),
+    calc_params as (
+        select
+            coalesce(tcc.s_vznos, 0) + coalesce(tcd.s_vznos, 0) as s_vznos,
+            coalesce(tcc.s_dd, 0) + coalesce(tcd.s_dd, 0) as s_dd,
+            coalesce(tcc.s_mgd, 0) + coalesce(tcd.s_mgd, 0) as s_mgd,
+            coalesce(tcc.s_vosp, 0) + coalesce(tcd.s_vosp, 0) as s_vosp,
+            coalesce(tcc.s_vypl, 0) + coalesce(tcd.s_vypl, 0) as s_vypl,
+            coalesce(tcc.s_perevod, 0) + coalesce(tcd.s_perevod, 0) as s_perevod,
+            coalesce(tcc.s_vypl, 0) + coalesce(tcd.s_vypl, 0)
+              + coalesce(tcc.s_perevod, 0) + coalesce(tcd.s_perevod, 0)
+                as s_vypl_per,
+            ss.d
+        from base b
+        left join trans_calc_credit tcc on tcc.id = b.id
+        left join trans_calc_debit tcd on tcd.id = b.id
+        left join successors_share ss on ss.id = b.id
+    ),
+    coeff_params as (
+        select
+            coalesce(t.k1, 1)::numeric as k1,
+            coalesce(t.k2, 1)::numeric as k2,
+            coalesce(t.k3, 1)::numeric as k3,
+            coalesce(t.k4, 1)::numeric as k4,
+            coalesce(t.kf, 1)::numeric as kf,
+            case
+                when t.sharer_id is null
+                    then jsonb_build_object('code', 'REDEMPTION_COEFF_NOT_FOUND')
+                else t.details_json
+            end as details_json,
+            t.inheritance_on_pay,
+            t.inheritance_on_accum
+        from base b
+        left join lateral (
+            select
+                grc.sharer_id,
+                grc.k1,
+                grc.k2,
+                grc.k3,
+                grc.k4,
+                grc.kf,
+                grc.details_json,
+                grc.inheritance_on_pay,
+                grc.inheritance_on_accum
+            from actuary.get_redemption_coeff(
+                b.id,
+                '{}'::integer[],
+                'NPO',
+                p_calc_date,
+                'Правопреемники',
+                null,
+                null
+            ) grc
+            where grc.sharer_id = b.id
+        ) t on true
+    ),
+
+    -- Поля коэффициентной функции могут быть text[], boolean[], text, boolean.
+    -- Дополнительно принимаем буквальные значения из БТ («Полное наследование»,
+    -- «Наследование в выплатном/накопительном периоде», «Наследование исключено»).
+    -- При противоречивых значениях не угадываем флаг, оставляем NULL.
+    inheritance_raw as (
+        select
+            cp.inheritance_on_pay,
+            cp.inheritance_on_accum,
+            to_jsonb(cp.inheritance_on_pay) as pay_json,
+            to_jsonb(cp.inheritance_on_accum) as accum_json
+        from coeff_params cp
+    ),
+    inheritance_text as (
+        select
+            r.inheritance_on_pay,
+            r.inheritance_on_accum,
+            (select array_agg(lower(btrim(v.value)))
+             from jsonb_array_elements_text(
+                case when jsonb_typeof(r.pay_json) = 'array' then r.pay_json
+                     else jsonb_build_array(r.inheritance_on_pay) end
+             ) v(value)) as pay_values,
+            (select array_agg(lower(btrim(v.value)))
+             from jsonb_array_elements_text(
+                case when jsonb_typeof(r.accum_json) = 'array' then r.accum_json
+                     else jsonb_build_array(r.inheritance_on_accum) end
+             ) v(value)) as accum_values
+        from inheritance_raw r
+    ),
+    inheritance_flags as (
+        select
+            t.inheritance_on_pay,
+            t.inheritance_on_accum,
+            case
+                when coalesce(p.has_true, false) and coalesce(p.has_false, false)
+                    then null::boolean
+                when coalesce(p.has_true, false) then true
+                when coalesce(p.has_false, false) then false
+                else null::boolean
+            end as on_pay,
+            case
+                when coalesce(a.has_true, false) and coalesce(a.has_false, false)
+                    then null::boolean
+                when coalesce(a.has_true, false) then true
+                when coalesce(a.has_false, false) then false
+                else null::boolean
+            end as on_accum,
+            coalesce(p.has_true, false) and coalesce(p.has_false, false)
+                as pay_conflict,
+            coalesce(a.has_true, false) and coalesce(a.has_false, false)
+                as accum_conflict
+        from inheritance_text t
+        cross join lateral (
+            select
+                bool_or(
+                    v in ('true', 't', '1', 'да', 'полное наследование')
+                    or v like '%наследован%выплат%'
+                ) as has_true,
+                bool_or(
+                    v in ('false', 'f', '0', 'нет', 'наследование исключено')
+                    or v like '%наследован%накоп%'
+                ) as has_false
+            from unnest(t.pay_values) as u(v)
+        ) p
+        cross join lateral (
+            select
+                bool_or(
+                    v in ('true', 't', '1', 'да', 'полное наследование')
+                    or v like '%наследован%накоп%'
+                ) as has_true,
+                bool_or(
+                    v in ('false', 'f', '0', 'нет', 'наследование исключено')
+                    or v like '%наследован%выплат%'
+                ) as has_false
+            from unnest(t.accum_values) as u(v)
+        ) a
+    ),
+    inheritance_mode as (
+        select
+            f.*,
+            case
+                when f.on_accum is true and f.on_pay is true then 'FULL'
+                when f.on_accum is true and f.on_pay is false then 'ACCUM_ONLY'
+                when f.on_accum is false and f.on_pay is true then 'PAY_ONLY'
+                when f.on_accum is false and f.on_pay is false then 'EXCLUDED'
+                else 'UNRESOLVED'
+            end::text as inheritance_type
+        from inheritance_flags f
+    ),
+    account_phase as (
+        select
+            b.last_status_code,
+            b.last_status_name,
+            b.last_status_date,
+            b.previous_status_code,
+            b.previous_status_name,
+            case
+                when lower(coalesce(
+                    case when b.last_status_code = 'IA0'
+                         then b.previous_status_name
+                         else b.last_status_name end,
+                    ''
+                )) like '%накоп%' then 'ACCUM'
+                when lower(coalesce(
+                    case when b.last_status_code = 'IA0'
+                         then b.previous_status_name
+                         else b.last_status_name end,
+                    ''
+                )) like '%выплат%' then 'PAY'
+                else 'UNKNOWN'
+            end::text as account_phase
+        from base b
+    ),
+    inheritance_decision as (
+        select
+            im.inheritance_on_pay,
+            im.inheritance_on_accum,
+            im.on_pay,
+            im.on_accum,
+            im.inheritance_type,
+            im.pay_conflict,
+            im.accum_conflict,
+            dp.death_date,
+            dp.death_month_start,
+            dp.death_month_end_exclusive,
+            ap.account_phase,
+            ap.last_status_code,
+            ap.last_status_name,
+            ap.last_status_date,
+            ap.previous_status_code,
+            ap.previous_status_name,
+            case
+                when im.inheritance_type = 'FULL' then true
+                when im.inheritance_type = 'ACCUM_ONLY'
+                    -- Согласно таблице БТ: накопительный период +
+                    -- закрытые счета после перевода средств в СР.
+                    -- Корректность отбора закрытых счетов обеспечивает caller.
+                    then ap.account_phase = 'ACCUM'
+                         or ap.last_status_code = 'IA0'
+                when im.inheritance_type = 'PAY_ONLY'
+                    -- Согласно БТ: выплатный период, включая IA0,
+                    -- но для IA0 предыдущий статус должен быть выплатным.
+                    then ap.account_phase = 'PAY'
+                else false
+            end as use_standard_redemption,
+            case
+                when im.pay_conflict or im.accum_conflict
+                    then 'CONFLICTING_INHERITANCE_FLAGS'
+                when im.inheritance_type = 'EXCLUDED'
+                     and dp.death_date is null
+                    then 'DEATH_DATE_REQUIRED_FOR_SETTLEMENT'
+                when im.inheritance_type = 'EXCLUDED'
+                    then 'ARREARS_SOURCE_REQUIRED'
+                when im.inheritance_type = 'UNRESOLVED'
+                    then 'INHERITANCE_FLAGS_UNKNOWN'
+                when im.inheritance_type in ('ACCUM_ONLY','PAY_ONLY')
+                    and ap.account_phase = 'UNKNOWN'
+                    and not (im.inheritance_type = 'ACCUM_ONLY'
+                             and ap.last_status_code = 'IA0')
+                    then 'ACCOUNT_PHASE_UNKNOWN'
+                else null::text
+            end as calculation_warning
+        from inheritance_mode im
+        cross join account_phase ap
+        cross join death_period dp
+    ),
+
+    -- Отдельно раскладываем фактические пенсионные выплаты/возвраты по
+    -- отношению к МЕСЯЦУ смерти. По БТ до конца месяца смерти возврат
+    -- относится к сумме наследования, после месяца — к переплате.
+    -- ВАЖНО: effective_date — дата проводки. Если месяц пенсионного
+    -- обязательства отличается, замените его здесь на дату периода выплаты.
+    -- Для корректного вычисления задолженности нужны сумма пенсии по месяцам,
+    -- дата приостановки и число неосуществленных выплат (их в этой ветке нет).
+    pension_payment_period as (
+        select
+            ta.transaction_id,
+            ta.direction,
+            ta.s_ts,
+            ta.signed_amount,
+            ta.effective_date::date as payment_period_date  -- TODO: фактический месяц пенсии, если отличается от даты проводки
+        from trans_amounts ta
+        where ta.s_ts = 's_vypl'
+    ),
+    pension_settlement as (
+        select
+            dp.death_date,
+            dp.death_month_start,
+            dp.death_month_end_exclusive,
+            sum(greatest(pp.signed_amount, 0)) filter (
+                where pp.payment_period_date < dp.death_month_end_exclusive
+            ) as paid_through_death_month,
+            sum(greatest(-pp.signed_amount, 0)) filter (
+                where pp.payment_period_date < dp.death_month_end_exclusive
+            ) as returned_through_death_month,
+            sum(greatest(pp.signed_amount, 0)) filter (
+                where pp.payment_period_date >= dp.death_month_end_exclusive
+            ) as paid_after_death_month,
+            sum(greatest(-pp.signed_amount, 0)) filter (
+                where pp.payment_period_date >= dp.death_month_end_exclusive
+            ) as returned_after_death_month
+        from death_period dp
+        left join pension_payment_period pp on dp.death_date is not null
+        group by dp.death_date,
+                 dp.death_month_start, dp.death_month_end_exclusive
+    ),
+
+    -- Из одного классифицированного набора получаем суммы для write_off.
+    ost_pre_calc as (
+        select
+            id,
+            s_ts,
+            mnemonics,
+            operation_name,
+            signed_amount as trans_amount
+        from trans_amounts
+        where s_ts in ('s_vznos', 's_dd', 's_mgd', 's_vosp')
+    ),
+    calc_ost as (
+        select
+            case opc.s_ts
+                when 's_vznos' then opc.trans_amount * cp.k1
+                when 's_dd' then opc.trans_amount * cp.k2
+                when 's_mgd' then opc.trans_amount * cp.k3
+                when 's_vosp' then opc.trans_amount * cp.k2
+            end as amount_with_k,
+            opc.s_ts,
+            opc.mnemonics,
+            opc.id
+        from ost_pre_calc opc
+        cross join coeff_params cp
+    ),
+    calc_ost_by_type as (
+        select
+            s_ts,
+            mnemonics,
+            sum(amount_with_k) as amount_with_k
+        from calc_ost
+        group by s_ts, mnemonics
+    ),
+    ost_priority as (
+        select
+            o.s_ts,
+            o.amount_with_k,
+            o.mnemonics,
+            row_number() over (
+                order by
+                    case o.s_ts
+                        when 's_dd' then 1
+                        when 's_vosp' then 2
+                        when 's_mgd' then 3
+                        when 's_vznos' then 4
+                    end,
+                    o.mnemonics
+            ) as priority
+        from calc_ost_by_type o
+    ),
+    write_off as (
+        select
+            o.priority,
+            o.s_ts,
+            o.amount_with_k,
+            o.mnemonics,
+            cp.s_vypl_per * cp1.k4 as payment_before,
+            least(
+                greatest(o.amount_with_k, 0),
+                greatest(cp.s_vypl_per * cp1.k4, 0)
+            ) as written_off,
+            o.amount_with_k - least(
+                greatest(o.amount_with_k, 0),
+                greatest(cp.s_vypl_per * cp1.k4, 0)
+            ) as amount_after,
+            greatest(
+                cp.s_vypl_per * cp1.k4
+                - least(
+                    greatest(o.amount_with_k, 0),
+                    greatest(cp.s_vypl_per * cp1.k4, 0)
+                ),
+                0
+            ) as payment_left
+        from ost_priority o
+        cross join calc_params cp
+        cross join coeff_params cp1
+        where o.priority = 1
+
+        union all
+
+        select
+            o.priority,
+            o.s_ts,
+            o.amount_with_k,
+            o.mnemonics,
+            w.payment_left as payment_before,
+            least(
+                greatest(o.amount_with_k, 0),
+                greatest(w.payment_left, 0)
+            ) as written_off,
+            o.amount_with_k - least(
+                greatest(o.amount_with_k, 0),
+                greatest(w.payment_left, 0)
+            ) as amount_after,
+            greatest(
+                w.payment_left
+                - least(
+                    greatest(o.amount_with_k, 0),
+                    greatest(w.payment_left, 0)
+                ),
+                0
+            ) as payment_left
+        from write_off w
+        join ost_priority o on o.priority = w.priority + 1
+    ),
+    write_off_json as (
+        select
+            coalesce(
+                jsonb_agg(
+                    jsonb_build_object(
+                        's_ts', w.s_ts,
+                        'mnemonics', w.mnemonics,
+                        'amount_before', w.amount_with_k,
+                        'payment_before', w.payment_before,
+                        'written_off', w.written_off,
+                        'amount_after_kf_d', coalesce((
+                            select r.pension
+                            from actuary.round_calc_res(
+                                v_round_type,
+                                case
+                                    when idec.use_standard_redemption
+                                        then w.amount_after * cp1.kf * cp.d
+                                    else 0::numeric
+                                end,
+                                v_service_type
+                            ) r
+                        ), 0),
+                        'amount_after', w.amount_after,
+                        'payment_left', w.payment_left
+                    ) order by w.priority
+                ),
+                '[]'::jsonb
+            ) as write_off_json
+        from write_off w
+        cross join coeff_params cp1
+        cross join calc_params cp
+        cross join inheritance_decision idec
+    ),
+
+    -- s_vykup с долей; s_vykup_without_share без доли.
+    -- Второе значение нужно для одноразового списания в СР.
+    calc_vykup as (
+        select
+            case when idec.use_standard_redemption
+                then v.s_vykup_full * cp.d
+                else 0::numeric
+            end as s_vykup,
+            case when idec.use_standard_redemption
+                then v.s_vykup_full
+                else 0::numeric
+            end as s_vykup_without_share,
+            v.s_vykup_full as s_vykup_before_inheritance_gate
+        from calc_params cp
+        cross join coeff_params cp1
+        cross join inheritance_decision idec
+        cross join lateral (
+            select
+                greatest(
+                    0,
+                    cp1.k1 * coalesce(cp.s_vznos, 0)
+                    + cp1.k2 * (coalesce(cp.s_dd, 0) + coalesce(cp.s_vosp, 0))
+                    + cp1.k3 * coalesce(cp.s_mgd, 0)
+                    - cp1.k4 * coalesce(cp.s_vypl, 0)
+                    - cp1.k4 * coalesce(cp.s_perevod, 0)
+                ) * cp1.kf as s_vykup_full
+        ) v
+    ),
+    sr_npo_prepare as (
+        select
+            greatest(
+                0,
+                cp.s_vznos + cp.s_dd + cp.s_mgd + cp.s_vosp
+                - cp.s_vypl - cp.s_perevod
+            )::numeric as raw_balance
+        from calc_params cp
+    ),
+    sr_npo as (
+        select
+            case
+                when idec.use_standard_redemption
+                    then greatest(
+                        0,
+                        sr.raw_balance - coalesce(cv.s_vykup_without_share, 0)
+                    )::numeric
+                else null::numeric
+            end as s_sr,
+            sr.raw_balance,
+            cv.s_vykup_without_share
+        from sr_npo_prepare sr
+        cross join calc_vykup cv
+        cross join inheritance_decision idec
+    ),
+
+    mapping_diagnostics as (
+        select
+            coalesce(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'direction', direction,
+                        'operation_name', operation_name,
+                        'mnemonics', mnemonics,
+                        'mapped_types', mapped_types
+                    )
+                ),
+                '[]'::jsonb
+            ) as ambiguous_mapping
+        from (
+            -- Схлопываем по комбинации, а не по каждому transaction_id:
+            -- не допускаем неконтролируемого увеличения JSON на больших счетах.
+            select
+                m.direction,
+                m.operation_name,
+                m.mnemonics,
+                array_agg(distinct m.s_ts order by m.s_ts) as mapped_types
+            from trans_mapped m
+            group by m.direction, m.operation_name, m.mnemonics
+            having count(distinct m.s_ts) > 1
+        ) x
+    ),
+    reserve_exclusion_diagnostics as (
+        select
+            jsonb_build_object(
+                'last_status_code', b.last_status_code,
+                'last_status_date', b.last_status_date,
+                'last_operation_before_close', loc.operation_name,
+                'last_operation_id', loc.operation_id,
+                'excluded_transactions', count(t.transaction_id),
+                'excluded_amount', coalesce(sum(t.trans_amount), 0)
+            ) as details
+        from base b
+        left join last_operation_before_close loc on true
+        left join trans_checked t on t.excluded_final_reserve
+        group by
+            b.last_status_code, b.last_status_date,
+            loc.operation_name, loc.operation_id
+    )
+
+    select
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cv.s_vykup, v_service_type) r
+        ), 0)::numeric,
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cp.s_vznos, v_service_type) r
+        ), 0)::numeric,
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cp.s_dd, v_service_type) r
+        ), 0)::numeric,
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cp.s_mgd, v_service_type) r
+        ), 0)::numeric,
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cp.s_vosp, v_service_type) r
+        ), 0)::numeric,
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cp.s_vypl, v_service_type) r
+        ), 0)::numeric,
+        coalesce((
+            select r.pension
+            from actuary.round_calc_res(v_round_type, cp.s_perevod, v_service_type) r
+        ), 0)::numeric,
+        null::numeric as s_finrez,
+        coalesce(cp1.k1, 0)::numeric,
+        coalesce(cp1.k2, 0)::numeric,
+        coalesce(cp1.k3, 0)::numeric,
+        coalesce(cp1.k4, 0)::numeric,
+        coalesce(cp1.kf, 0)::numeric,
+        coalesce(cp.d, 0)::numeric,
+        jsonb_build_object(
+            'credit_included',
+            coalesce(tij.credit_included_json, '[]'::jsonb),
+            'credit_not_included',
+            coalesce(nij.credit_not_included_json, '[]'::jsonb),
+            'debit_included',
+            coalesce(tij.debit_included_json, '[]'::jsonb),
+            'debit_not_included',
+            coalesce(nij.debit_not_included_json, '[]'::jsonb),
+            'write_off',
+            woj.write_off_json,
+            's_sr',
+            jsonb_build_object(
+                'amount', sr.s_sr,
+                'raw_balance', coalesce(sr.raw_balance, 0),
+                's_vykup_without_share', coalesce(sr.s_vykup_without_share, 0),
+                'share_applied', false,
+                'calculation_performed', idec.use_standard_redemption
+            ),
+            'inheritance',
+            jsonb_build_object(
+                'inheritance_on_pay', cp1.inheritance_on_pay,
+                'inheritance_on_accum', cp1.inheritance_on_accum,
+                'on_pay', idec.on_pay,
+                'on_accum', idec.on_accum,
+                'inheritance_type', idec.inheritance_type,
+                'account_phase', idec.account_phase,
+                'last_status_code', idec.last_status_code,
+                'last_status_name', idec.last_status_name,
+                'previous_status_code', idec.previous_status_code,
+                'previous_status_name', idec.previous_status_name,
+                'use_standard_redemption', idec.use_standard_redemption,
+                'calculation_warning', idec.calculation_warning,
+                'requires_arrears_overpayment_calc',
+                    idec.inheritance_type = 'EXCLUDED',
+                'death_date', idec.death_date,
+                'death_month_start', idec.death_month_start,
+                'death_month_end_exclusive', idec.death_month_end_exclusive,
+                'pay_conflict', idec.pay_conflict,
+                'accum_conflict', idec.accum_conflict,
+                's_vykup_before_inheritance_gate',
+                    cv.s_vykup_before_inheritance_gate
+            ),
+            'pension_settlement',
+            jsonb_build_object(
+                'date_period_source', 'effective_date (TODO: verify pension period)',
+                'death_date', ps.death_date,
+                'period_end_exclusive', ps.death_month_end_exclusive,
+                'paid_through_death_month',
+                    case when ps.death_date is not null
+                         then coalesce(ps.paid_through_death_month, 0)
+                         else null::numeric end,
+                'returned_through_death_month',
+                    case when ps.death_date is not null
+                         then coalesce(ps.returned_through_death_month, 0)
+                         else null::numeric end,
+                'paid_after_death_month',
+                    case when ps.death_date is not null
+                         then coalesce(ps.paid_after_death_month, 0)
+                         else null::numeric end,
+                'returned_after_death_month',
+                    case when ps.death_date is not null
+                         then coalesce(ps.returned_after_death_month, 0)
+                         else null::numeric end,
+                'overpayment_net_by_operation_date',
+                    case when ps.death_date is not null
+                         then greatest(0,
+                            coalesce(ps.paid_after_death_month, 0)
+                            - coalesce(ps.returned_after_death_month, 0))
+                         else null::numeric end,
+                'arrears', null::numeric,
+                'financial_settlement_applied', false
+            ),
+            'mapping_diagnostics',
+            md.ambiguous_mapping,
+            'reserve_exclusion',
+            red.details,
+            'exception',
+            jsonb_build_object(
+                'error', cp1.details_json,
+                'share_not_found', cp.d is null,
+                'inheritance_warning', idec.calculation_warning
+            )
+        )::jsonb as details_json
+    from calc_params cp
+    cross join coeff_params cp1
+    cross join calc_vykup cv
+    cross join write_off_json woj
+    cross join sr_npo sr
+    cross join mapping_diagnostics md
+    cross join reserve_exclusion_diagnostics red
+    cross join inheritance_decision idec
+    cross join pension_settlement ps
+    left join trans_included_json tij on true
+    left join trans_not_included_json nij on true;
+
+end if;
