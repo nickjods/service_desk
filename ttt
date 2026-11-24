@@ -1,17 +1,419 @@
-USE [project_xbrl];
+"CREATE FUNCTION [npo].[lastPayPension] (@date date)
+RETURNS  TABLE as 
+RETURN (
+-----------------------------------------------------------
+----   Последняя Выплата пенсии        ----
+-----------------------------------------------------------
+select [transaction].[ID_SHARER]
+,max([transaction].[VALUE_DATE]) as [VALUE_DATE]
+,sum(
+ case 
+      when [transaction].[CODE_OPERATION] in (6	/*Выплата пенсии участнику*/ ,13	/*Подоходный налог с пенсии*/ ,14	/*Выплата по исполнительному листу*/) and [transaction].[TYPE_VALUE] = 'DB' 
+      then  [transaction].[VALUE] 
+      when [transaction].[CODE_OPERATION] in (33	/*Возврат пенсий*/,34	/*Возврат НДФЛ с пенсий*/) and [transaction].[TYPE_VALUE] = 'CR' 
+      then -1 * [transaction].[VALUE]
+      else 0 end ) as [VALUE]
+from [project_xbrl].[npo].[transaction]() as [transaction]
+           join [npo].[registrSharer]() as [sharer] on [sharer].[ID_SHARER] = [transaction].[ID_SHARER] and [sharer].[SHARER_TYPE] = N'ФЛ' 
+where [transaction].[CODE_OPERATION] in (6	/*Выплата пенсии участнику*/ 
+                                                                                    ,13	/*Подоходный налог с пенсии*/ 
+                                                                                    ,14	/*Выплата по исполнительному листу*/
+                                                                                    ,33	/*Возврат пенсий*/
+                                                                                    ,34	/*Возврат НДФЛ с пенсий*/ )
+                                                                                    
+      and [transaction].[VALUE_DATE] <= @date
+group by [transaction].[ID_SHARER]
+) ;"
 
-SELECT
-    o.name AS function_name,
-    m.definition AS function_sql
-FROM sys.objects AS o
-JOIN sys.sql_modules AS m ON m.object_id = o.object_id
-WHERE o.schema_id = SCHEMA_ID(N'npo')
-  AND o.name IN (
-      N'transaction',
-      N'transactionInpayment',    N'transactionInpaymentFirst',
-      N'transactionMergeAccount', N'transactionOtherTransfer',
-      N'transactionPension',      N'transactionTransfer',
-      N'transactionAssignee',     N'transactionTransferDate',
-      N'transactionIncome',       N'lastPayPension'
-  )
-ORDER BY o.name;
+"CREATE FUNCTION [npo].[transaction] ()
+RETURNS TABLE 
+AS
+RETURN 
+(
+-----------------------------------------------------------
+--список транзакций 
+-----------------------------------------------------------
+select 
+ [transaction].[npo_pension_account_id]  as [ID_SHARER]
+,[typeAccount].[npo_operation_type_code] as [CODE_OPERATION]
+,cast([transaction].[period_date] as date) as [VALUE_DATE]
+
+,[transaction].[amount] as [VALUE]
+
+,
+case 
+when [transaction].[record_kind] = 0 
+then 1
+else -1
+end as [SIGN_VALUE]
+
+,
+case 
+when [transaction].[record_kind] = 0 
+then N'CR'
+else N'DB'
+end as [TYPE_VALUE]
+
+,[transaction].[period_date] as [VALUE_TIME]
+
+,[transaction].[name] as [NAME_OPERATION]
+,[typeAccount].[npo_operation_type_name] as [SUB_ACCOUNT_TYPE]
+,[transaction].[comment] as [COMMENT]
+
+,[transaction].[register_object_type] as [ID_TYPE_DOCUMENT]
+,[transaction].[register_document_id] as [ID_DOCUMENT]
+,[transaction].[npo_operation_type_id] as [ID_ACCOUNT_TYPE]
+from [DWH].[npf].[npo_pension_account_operation] as [transaction]  with(nolock)
+      left join [DWH].[npf].[npo_operation_types] as [typeAccount] with(nolock) on [typeAccount].[npo_operation_type_id] = [transaction].[npo_operation_type_id]
+            and [typeAccount].[is_marked_for_delete] = 0
+where [transaction].[is_active] = 1
+);"
+
+"CREATE FUNCTION [npo].[transaction] ()
+RETURNS TABLE 
+AS
+RETURN 
+(
+-----------------------------------------------------------
+--список транзакций 
+-----------------------------------------------------------
+select 
+ [transaction].[npo_pension_account_id]  as [ID_SHARER]
+,[typeAccount].[npo_operation_type_code] as [CODE_OPERATION]
+,cast([transaction].[period_date] as date) as [VALUE_DATE]
+
+,[transaction].[amount] as [VALUE]
+
+,
+case 
+when [transaction].[record_kind] = 0 
+then 1
+else -1
+end as [SIGN_VALUE]
+
+,
+case 
+when [transaction].[record_kind] = 0 
+then N'CR'
+else N'DB'
+end as [TYPE_VALUE]
+
+,[transaction].[period_date] as [VALUE_TIME]
+
+,[transaction].[name] as [NAME_OPERATION]
+,[typeAccount].[npo_operation_type_name] as [SUB_ACCOUNT_TYPE]
+,[transaction].[comment] as [COMMENT]
+
+,[transaction].[register_object_type] as [ID_TYPE_DOCUMENT]
+,[transaction].[register_document_id] as [ID_DOCUMENT]
+,[transaction].[npo_operation_type_id] as [ID_ACCOUNT_TYPE]
+from [DWH].[npf].[npo_pension_account_operation] as [transaction]  with(nolock)
+      left join [DWH].[npf].[npo_operation_types] as [typeAccount] with(nolock) on [typeAccount].[npo_operation_type_id] = [transaction].[npo_operation_type_id]
+            and [typeAccount].[is_marked_for_delete] = 0
+where [transaction].[is_active] = 1
+);"
+
+"CREATE FUNCTION [npo].[transactionAssignee] (@startDate date, @endDate date)
+RETURNS TABLE
+RETURN (
+----------------------------------------------------------------------------------
+--Выплаты правопреемникам
+----------------------------------------------------------------------------------
+select 
+[transaction].[ID_SHARER]
+,
+sum(
+case
+when [sharer].[ACCOUNT_TYPE] = N'ИПС' and [sharer].[SHARER_TYPE] = N'ФЛ'
+then 
+     case when [transaction].[CODE_OPERATION] in (
+                                                                                    20	--Выплата унаследованных сумм
+                                                                                   ,50 --Выплата унаследованных сумм - дополнительная выплата
+                                                                                   ,21	--Подоходный налог с унаследованной суммы
+                                                                                   )
+      then [transaction].[VALUE]
+      else - [transaction].[VALUE]
+      end
+when [sharer].[ACCOUNT_TYPE] = N'СПС' and [sharer].[SHARER_TYPE] = N'ЮЛ'
+then 
+     case when [transaction].[CODE_OPERATION] in (
+                                                                                    20	--Выплата унаследованных сумм
+                                                                                   ,50 --Выплата унаследованных сумм - дополнительная выплата
+                                                                                   ,21	--Подоходный налог с унаследованной суммы
+                                                                                   )
+      then [transaction].[VALUE]
+      else - [transaction].[VALUE]
+      end
+else 0    
+end) 
+as [VALUE]
+from [project_xbrl].[npo].[transaction]() as [transaction]
+     join [npo].[registrSharer]() as [sharer] on [sharer].[ID_SHARER] = [transaction].[ID_SHARER]
+where [transaction].[VALUE_DATE] between @startDate and @endDate
+      and [transaction].[CODE_OPERATION] in ( 
+                                                                           20	--Выплата унаследованных сумм
+                                                                          ,50 --Выплата унаследованных сумм - дополнительная выплата
+                                                                          ,21	--Подоходный налог с унаследованной суммы
+                                              
+                                                                          ,37	--Возврат унаследованных сумм
+                                                                         )
+group by [transaction].[ID_SHARER]
+) ;"
+
+"CREATE FUNCTION [npo].[transactionIncome] (@startDate date, @endDate date)
+RETURNS TABLE AS
+RETURN (
+------------------------------------------------------------------------------------------------------------------------------------------------------
+---- Финансовый результат от размещения пенсионных резервов за период @startDate and @endDate     ----
+------------------------------------------------------------------------------------------------------------------------------------------------------
+select [data].[ID_SHARER],sum([data].[VALUE]) as [VALUE]
+from (
+          select [transaction].[ID_SHARER],[transaction].[SIGN_VALUE] * [transaction].[VALUE] as [VALUE]
+          from [project_xbrl].[npo].[transaction]() as [transaction]
+          where [transaction].[CODE_OPERATION] in (  5	/*МГД*/,12	/*Доначисленный доход*/  )
+                and [transaction].[VALUE_DATE] between @startDate and @endDate
+                and (month([transaction].[VALUE_DATE]) = 12  and day([transaction].[VALUE_DATE]) = 31)
+              )  as [data]        
+       join [npo].[registrSharer]() as [sharer] on [data].[ID_SHARER] = [sharer].[ID_SHARER]
+group by [data].[ID_SHARER]         
+) ;"
+"CREATE FUNCTION [npo].[transactionInpayment] (@startDate date, @endDate date)
+RETURNS TABLE AS
+RETURN (
+-----------------------------------------------------------
+----   Взносы за период @startDate and @endDate        ----
+-----------------------------------------------------------
+select 
+[transaction].[ID_SHARER]
+,sum([transaction].[SIGN_VALUE] * [transaction].[VALUE]) as [VALUE]
+from [project_xbrl].[npo].[transaction]() as [transaction]
+     join [npo].[registrSharer]() as [sharer] on [sharer].[ID_SHARER] = [transaction].[ID_SHARER]
+where [transaction].[VALUE_DATE] between @startDate and @endDate
+      and [transaction].[CODE_OPERATION] in (  4	--От работодателя
+                                              ,8	--Целевые взносы
+                                              ,11	--Ч/з банк
+                                              ,38	--Возврат взносов вкладчику
+                                             )
+group by [transaction].[ID_SHARER]
+);"
+
+"CREATE FUNCTION [npo].[transactionInpaymentFirst] (@date date)
+RETURNS TABLE AS
+RETURN (
+----------------------------------------------------
+----   Первая операция взносов        ----
+----------------------------------------------------
+select 
+[transaction].[ID_SHARER]
+,sum([transaction].[SIGN_VALUE] * [transaction].[VALUE]) as [VALUE]
+,[transaction].[VALUE_DATE]
+from [project_xbrl].[npo].[transaction]() as [transaction]
+      join (
+               select [transaction].[ID_SHARER],min([transaction].[VALUE_DATE]) as [VALUE_DATE]
+               from [project_xbrl].[npo].[transaction]() as [transaction]
+               where [transaction].[CODE_OPERATION] in (  
+                                                                                                      4	/*От работодателя*/ ,8	/*Целевые взносы*/ ,11	/*Ч/з банк*/
+                                                                                                     ,30	/*Перевод между счетами (со взносов)*/ ,31	/*Перевод между счетами (с дохода)*/
+                                                                                                     ,29 /*Слияние счетов (с дохода)*/ ,7 /*Слияние счетов (со взносов)*/                                                                                         
+                                                                                                    )
+                     and [transaction].[VALUE_DATE] <= @date
+                     and [type_value] = 'CR' 
+                 group by [transaction].[ID_SHARER]     
+                 ) as [transactionFirst] on [transaction].[ID_SHARER] = [transactionFirst].[ID_SHARER] and [transaction].[VALUE_DATE] = [transactionFirst].[VALUE_DATE]
+where  [transaction].[CODE_OPERATION] in (  
+                                                                                          4	/*От работодателя*/ ,8	/*Целевые взносы*/ ,11	/*Ч/з банк*/
+                                                                                         ,30	/*Перевод между счетами (со взносов)*/ ,31	/*Перевод между счетами (с дохода)*/
+                                                                                         ,29 /*Слияние счетов (с дохода)*/ ,7 /*Слияние счетов (со взносов)*/                                                                                         
+                                                                                       )
+       and [transaction].[VALUE_DATE] <= @date
+       and [type_value] = 'CR' 
+group by [transaction].[ID_SHARER],[transaction].[VALUE_DATE]
+);"
+
+"CREATE FUNCTION [npo].[transactionMergeAccount] (@startDate date, @endDate date)
+RETURNS TABLE
+RETURN (
+-------------------------------------------------------------------
+--Сумма переводов по счету за отчетный период
+------------------------------------------------------------------
+select [data].[ID_SHARER],sum([data].[VALUE]) as [VALUE]
+from (
+                select [transaction].[ID_SHARER],[transaction].[SIGN_VALUE] * [transaction].[VALUE] as [VALUE]
+                from [project_xbrl].[npo].[transaction]() as [transaction]
+                where [transaction].[CODE_OPERATION] in ( 23	--Списание в СР
+                                                                                         ,24	--Поступление из СР
+                                                                                         ,7	  --Слияние счетов (со взносов)
+                                                                                         ,29	--Слияние счетов (с дохода)
+                                                                                         )
+                          and [transaction].[VALUE_DATE] between @startDate and @endDate
+
+                      union all
+
+                      select [transaction].[ID_SHARER],[transaction].[SIGN_VALUE] * [transaction].[VALUE] as [VALUE]
+                      from [project_xbrl].[npo].[transaction]() as [transaction]
+                      where [transaction].[CODE_OPERATION] in (  5	/*МГД*/ ,12	/*Доначисленный доход*/   )
+                             and [transaction].[VALUE_DATE] between @startDate and @endDate
+                             and not (month([transaction].[VALUE_DATE]) = 12  and day([transaction].[VALUE_DATE]) = 31)
+                             
+                             
+                    union all
+                    
+                    --https://portal.futurenpf.ru/company/personal/user/3645/tasks/task/view/32628/
+                    /* 0420258 форма переводы с СПС на ИПС и обратно
+                    Прошу в 0420258 форме движения между ИПС и СПС в обе стороны отражать в столбце ""Сумма переводов""
+                    */
+                    select [transaction].[ID_SHARER] ,sum([transaction].[SIGN_VALUE] * [transaction].[VALUE]) as [VALUE]
+                    from [project_xbrl].[npo].[transaction]() as [transaction]
+                               join [npo].[registrSharer]() as [sharer] on [transaction].[ID_SHARER] = [sharer].[ID_SHARER] 
+                    where [transaction].[VALUE_DATE] between @startDate and @endDate
+                                       and [transaction].[CODE_OPERATION] in ( 30	/*Перевод между счетами (со взносов)*/ ,31	/*Перевод между счетами (с дохода)*/  )
+                                       and [transaction].[ID_DOCUMENT] in (
+                                                                                                                 select  [transaction].[ID_DOCUMENT]
+                                                                                                                 from [project_xbrl].[npo].[transaction]() as [transaction]
+                                                                                                                                           join [npo].[registrSharer]() as [sharer] on [transaction].[ID_SHARER] = [sharer].[ID_SHARER]
+                                                                                                                  where [transaction].[VALUE_DATE] between @startDate and @endDate
+                                                                                                                                                      and [transaction].[CODE_OPERATION] in ( 30	/*Перевод между счетами (со взносов)*/ ,31	/*Перевод между счетами (с дохода)*/  )
+                                                                                                                  group by [transaction].[ID_DOCUMENT]
+                                                                                                                  having count(distinct [sharer].[ACCOUNT_TYPE]) = 2
+                                                                                                                  )
+                       group by [transaction].[ID_SHARER]
+                    
+       )  as [data]        
+       join [npo].[registrSharer]() as [sharer] on [data].[ID_SHARER] = [sharer].[ID_SHARER]
+
+group by [data].[ID_SHARER]        
+);"
+
+"CREATE FUNCTION [npo].[transactionOtherTransfer] (@startDate date, @endDate date)
+RETURNS TABLE as 
+RETURN (
+-------------------------------------------------------
+----   Иные переводы по счету            ----
+------------------------------------------------------
+select [ID_SHARER], sum([VALUE]) as [VALUE]
+from (
+                        select [transaction].[ID_SHARER] ,sum([transaction].[SIGN_VALUE] * [transaction].[VALUE]) as [VALUE]
+                        from [project_xbrl].[npo].[transaction]() as [transaction]
+                                 join [npo].[registrSharer]() as [sharer] on [transaction].[ID_SHARER] = [sharer].[ID_SHARER]
+                        where [transaction].[VALUE_DATE] between @startDate and @endDate
+                                                               and [transaction].[CODE_OPERATION] in ( 30	/*Перевод между счетами (со взносов)*/ ,31	/*Перевод между счетами (с дохода)*/  )
+                                            
+                                                              --https://portal.futurenpf.ru/company/personal/user/3645/tasks/task/view/32628/
+                                                              /* 0420258 форма переводы с СПС на ИПС и обратно
+                                                              Прошу в 0420258 форме движения между ИПС и СПС в обе стороны отражать в столбце ""Сумма переводов""
+                                                              */
+                                                               and [transaction].[ID_DOCUMENT] in (
+                                                                                                                                         select  [transaction].[ID_DOCUMENT]
+                                                                                                                                         from [project_xbrl].[npo].[transaction]() as [transaction]
+                                                                                                                                                                   join [npo].[registrSharer]() as [sharer] on [transaction].[ID_SHARER] = [sharer].[ID_SHARER]
+                                                                                                                                          where [transaction].[VALUE_DATE] between @startDate and @endDate
+                                                                                                                                                                              and [transaction].[CODE_OPERATION] in ( 30	/*Перевод между счетами (со взносов)*/ ,31	/*Перевод между счетами (с дохода)*/  )
+                                                                                                                                          group by [transaction].[ID_DOCUMENT]
+                                                                                                                                          having count(distinct [sharer].[ACCOUNT_TYPE]) = 1
+                                                                                                                                          )
+                                                                                                                                          
+                        group by [transaction].[ID_SHARER]        
+
+                        union all
+
+                        select [transaction].[ID_SHARER] ,
+                         sum(
+                         case 
+                              when [transaction].[CODE_OPERATION] in (6	/*Выплата пенсии участнику*/ ,13	/*Подоходный налог с пенсии*/ ,14	/*Выплата по исполнительному листу*/) and [transaction].[TYPE_VALUE] = 'DB' 
+                              then  case when  [sharer].[SHARER_TYPE] = N'ФЛ' then  [transaction].[VALUE] else -1 * [transaction].[VALUE] end 
+                              when [transaction].[CODE_OPERATION] in (33	/*Возврат пенсий*/,34	/*Возврат НДФЛ с пенсий*/) and [transaction].[TYPE_VALUE] = 'CR' 
+                              then  case  when [sharer].[SHARER_TYPE] = N'ФЛ' then   -1 * [transaction].[VALUE] else [transaction].[VALUE] end
+                              else 0 end
+                             ) as [VALUE]
+                         from [project_xbrl].[npo].[transaction]() as [transaction]
+                                   join [npo].[registrSharer]() as [sharer] on [sharer].[ID_SHARER] = [transaction].[ID_SHARER] and [sharer].[ACCOUNT_TYPE] = N'СПС'
+                        where [transaction].[CODE_OPERATION] in (6	/*Выплата пенсии участнику*/ ,13	/*Подоходный налог с пенсии*/ ,14	/*Выплата по исполнительному листу*/
+                                                                                                            ,33	/*Возврат пенсий*/,34	/*Возврат НДФЛ с пенсий*/ )
+                              and [transaction].[VALUE_DATE] between @startDate and @endDate
+                        group by [transaction].[ID_SHARER]
+) as [data]  group by  [ID_SHARER]
+
+) ;"
+
+"CREATE FUNCTION [npo].[transactionPension] (@startDate date, @endDate date)
+RETURNS  TABLE as 
+RETURN (
+----------------------------------
+----   Выплата пенсии        ----
+---------------------------------
+select [transaction].[ID_SHARER],
+sum(
+ case 
+      when [transaction].[CODE_OPERATION] in (6	/*Выплата пенсии участнику*/ ,13	/*Подоходный налог с пенсии*/ ,14	/*Выплата по исполнительному листу*/) and [transaction].[TYPE_VALUE] = 'DB' 
+      then  [transaction].[VALUE] 
+      when [transaction].[CODE_OPERATION] in (33	/*Возврат пенсий*/,34	/*Возврат НДФЛ с пенсий*/) and [transaction].[TYPE_VALUE] = 'CR' 
+      then -1 * [transaction].[VALUE]
+      else 0 end ) as [VALUE]
+from [project_xbrl].[npo].[transaction]() as [transaction]
+           join [npo].[registrSharer]() as [sharer] on [sharer].[ID_SHARER] = [transaction].[ID_SHARER] and [sharer].[SHARER_TYPE] = N'ФЛ' 
+where [transaction].[CODE_OPERATION] in (6	/*Выплата пенсии участнику*/ ,13	/*Подоходный налог с пенсии*/ ,14	/*Выплата по исполнительному листу*/
+                                                                                    ,33	/*Возврат пенсий*/,34	/*Возврат НДФЛ с пенсий*/ )
+      and [transaction].[VALUE_DATE] between @startDate and @endDate
+group by [transaction].[ID_SHARER]
+) ;"
+
+"CREATE FUNCTION [npo].[transactionTransfer] (@startDate date, @endDate date)
+RETURNS TABLE
+RETURN (
+-------------------------------------------------------------------------------
+--Выкупная сумма 
+-------------------------------------------------------------------------------
+select 
+[transaction].[ID_SHARER]
+,sum( 
+case 
+when [transaction].[CODE_OPERATION] in (
+                                                                        17	--Выплата выкупной суммы
+                                                                       ,49  --Выплата выкупной суммы - дополнительная выплата
+                                                                       ,19	--Подоходный налог с выкупной суммы
+                                                                       ,39	--Выплата выкупной суммы без расторжения
+                                                                       )
+then [transaction].[VALUE] 
+else - [transaction].[VALUE] 
+end
+) as [VALUE]
+,max([transaction].[VALUE_DATE]) as [VALUE_DATE]
+from [project_xbrl].[npo].[transaction]() as [transaction]
+     join [npo].[registrSharer]() as [sharer] on [sharer].[ID_SHARER] = [transaction].[ID_SHARER]
+where [transaction].[VALUE_DATE] between @startDate and @endDate
+      and [transaction].[CODE_OPERATION] in (  
+                                                                        17	--Выплата выкупной суммы
+                                                                       ,49  --Выплата выкупной суммы - дополнительная выплата
+                                                                       ,19	--Подоходный налог с выкупной суммы
+                                                                       ,39	--Выплата выкупной суммы без расторжения
+                                              
+                                                                      ,35	--Возврат выкупных сумм
+                                                                      ,36	--Возврат НДФЛ с выкупных сумм
+                                                                     )
+group by [transaction].[ID_SHARER]
+) ;"
+
+"CREATE FUNCTION [npo].[transactionTransferDate] (@Date date)
+RETURNS TABLE
+RETURN (
+-------------------------------------------------------------------------------
+--Выкупная сумма 
+-------------------------------------------------------------------------------
+select [transaction].[npo_pension_account_id]  as [ID_SHARER]
+,cast(min([transaction].[period_date]) as date) as [VALUE_DATE]
+,cast(max([transaction].[period_date]) as date) as [LAST_DATE]
+from [DWH].[npf].[npo_pension_account_operation] as [transaction] 
+     join [DWH].[npf].[npo_operation_types] as [typeAccount] on [typeAccount].[npo_operation_type_id] = [transaction].[npo_operation_type_id]
+            and [typeAccount].[is_marked_for_delete] = 0
+            and [typeAccount].[npo_operation_type_code] in (17 ,49 ) --Выплата выкупной суммы
+where [transaction].[is_active] = 1
+and [transaction].[period_date] < dateadd(day,1,@Date)
+group by [transaction].[npo_pension_account_id]
+) ;"
+
+
+
+
+
+
+
