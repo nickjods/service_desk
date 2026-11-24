@@ -1,1 +1,17 @@
-1
+USE [project_xbrl];
+
+SELECT
+    o.name AS function_name,
+    m.definition AS function_sql
+FROM sys.objects AS o
+JOIN sys.sql_modules AS m ON m.object_id = o.object_id
+WHERE o.schema_id = SCHEMA_ID(N'npo')
+  AND o.name IN (
+      N'transaction',
+      N'transactionInpayment',    N'transactionInpaymentFirst',
+      N'transactionMergeAccount', N'transactionOtherTransfer',
+      N'transactionPension',      N'transactionTransfer',
+      N'transactionAssignee',     N'transactionTransferDate',
+      N'transactionIncome',       N'lastPayPension'
+  )
+ORDER BY o.name;
