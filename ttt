@@ -1,1 +1,73 @@
-1
+select
+    t.id as transaction_id,
+    t.value,
+    t.effective_date,
+
+    ac.owner_sharer_id as credit_owner_sharer_id,
+    ad.owner_sharer_id as debit_owner_sharer_id,
+    ad.owner_individual_id as debit_owner_individual_id,
+
+    atc.mnemonics as credit_mnemonics,
+    atd.mnemonics as debit_mnemonics,
+
+    -- Проверка источников
+    (ac.owner_sharer_id = b.id) as credit_sharer_ok,
+    (ad.owner_sharer_id = b.id) as debit_sharer_ok,
+    (ad.owner_individual_id = b.individual_id)
+        as debit_individual_ok,
+
+    -- Проверка мнемоники CREDIT
+    exists (
+        select 1
+        from settings sc
+        where sc.s_ts = 's_pereplat'
+          and sc.direction = 'debit'
+          and sc.mnemonics = atc.mnemonics
+    ) as credit_mapping_ok,
+
+    -- Проверка мнемоники DEBIT
+    exists (
+        select 1
+        from settings sc
+        where sc.s_ts = 's_pereplat'
+          and sc.direction = 'debit'
+          and sc.mnemonics = atd.mnemonics
+    ) as debit_mapping_ok,
+
+    -- Проверка периода
+    (t.effective_date >= dp.death_month_end_exclusive)
+        as period_start_ok,
+
+    (t.effective_date < p_calc_date + 1)
+        as period_end_ok,
+
+    -- На каком этапе пропала транзакция
+    exists (
+        select 1
+        from trans_source ts
+        where ts.transaction_id = t.id
+    ) as found_in_source,
+
+    exists (
+        select 1
+        from pereplat_candidates pc
+        where pc.transaction_id = t.id
+    ) as found_in_pereplat
+
+from base b
+cross join death_period dp
+
+join back_office.transaction t
+    on t.id = 123456  -- Замени на нужный transaction_id
+
+join back_office.account ac
+    on ac.id = t.credit_account_id
+
+join back_office.account ad
+    on ad.id = t.debit_account_id
+
+join back_office.account_type atc
+    on atc.id = ac.account_type_id
+
+join back_office.account_type atd
+    on atd.id = ad.account_type_id;
