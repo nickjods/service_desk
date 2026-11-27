@@ -1,256 +1,217 @@
 CREATE OR REPLACE FUNCTION actuary.get_balance_by_pension_scheme(p_start_date date, p_end_date date, p_service_type text)
-RETURNS TABLE (date date, scheme_contract text, portfolioinvest text, balancevalue numeric, account_type text, sharer_type text)
-LANGUAGE plpgsql
+ RETURNS TABLE(date date, scheme_contract text, portfolioinvest text, balancevalue numeric, account_type text, sharer_type text)
+ LANGUAGE plpgsql
 AS $function$
-DECLARE
-    v_started_at timestamptz;
-    v_rows bigint;
-   
-    v_datetime_end timestamp;
-begin
-	
-	v_datetime_end = p_end_date::timestamp + interval '23 hours 59 minutes';
-	
-    IF p_start_date IS NULL OR p_end_date IS NULL THEN
-        RAISE EXCEPTION 'Inputs dates is NULL';
-    END IF;
+	declare
+		v_started_at timestamptz;
+		v_rows bigint;
 
-    v_started_at := clock_timestamp();
-    CREATE TEMP TABLE tmp_gbbps_balance ON COMMIT DROP AS
-    WITH fl_owners AS (
-        SELECT s.id AS sharer_id, c.id AS contract_id
-        FROM ourpension.sharer s
-        JOIN ourpension.contract c ON c.id = s.contract_id
-        WHERE s.individual_id IS NOT NULL
-          AND c.service_type = p_service_type
-    ),
-    ul_contracts AS (
-        SELECT c.id AS contract_id
-        FROM ourpension.contract c
-        WHERE c.service_type = p_service_type
-          AND EXISTS (
-              SELECT 1
-              FROM ourpension.sharer s
-              WHERE s.contract_id = c.id AND s.individual_id IS NULL
-          )
-    )
-    SELECT fl.sharer_id AS owner_sharer_id, fl.contract_id AS fl_contract_id,
-           ul.contract_id AS owner_contract_id,
-           b.start_date, b.end_date, b.total_credit - b.total_debit AS amount
-    FROM back_office.balance b
-    JOIN back_office.account a ON a.id = b.account_id
-    LEFT JOIN fl_owners fl ON fl.sharer_id = a.owner_sharer_id
-    LEFT JOIN ul_contracts ul ON ul.contract_id = a.owner_contract_id
-    WHERE b.start_date <= p_end_date
-      AND b.end_date >= p_start_date
-      AND (fl.sharer_id IS NOT NULL OR ul.contract_id IS NOT NULL);
+	begin
+		if p_start_date is null or p_end_date is null then
+			raise exception 'Inputs dates is NULL';
+		end if;
 
-    GET DIAGNOSTICS v_rows = ROW_COUNT;
-    ANALYZE pg_temp.tmp_gbbps_balance;
-    RAISE NOTICE 'Загрузка баланса: % строк, %', v_rows, clock_timestamp() - v_started_at;
+		v_started_at := clock_timestamp();
+		create temp table tmp_gbbps_balance on commit drop as
+		with fl_owners as (
+			select
+				s.id as sharer_id,
+				c.id as contract_id
+			from ourpension.sharer s
+			join ourpension.contract c on c.id = s.contract_id
+			where s.individual_id is not null
+				and c.service_type = p_service_type
+		),
+		ul_contracts as (
+			select
+				c.id as contract_id
+			from ourpension.contract c
+			where c.service_type = p_service_type
+				and exists (
+					select 1
+					from ourpension.sharer s
+					where s.contract_id = c.id and s.individual_id is null
+				)
+		)
+		select
+			fl.sharer_id as owner_sharer_id,
+			fl.contract_id as fl_contract_id,
+			ul.contract_id as owner_contract_id,
+			b.start_date,
+			b.end_date,
+			b.total_credit - b.total_debit as amount
+		from back_office.balance b
+		join back_office.account a on a.id = b.account_id
+		left join fl_owners fl on fl.sharer_id = a.owner_sharer_id
+		left join ul_contracts ul on ul.contract_id = a.owner_contract_id
+		where b.start_date <= p_end_date
+			and b.end_date >= p_start_date
+			and (fl.sharer_id is not null or ul.contract_id is not null);
 
-    v_started_at := clock_timestamp();
+		get diagnostics v_rows = row_count;
+		analyze pg_temp.tmp_gbbps_balance;
+		raise notice 'Загрузка баланса: % строк, %', v_rows, clock_timestamp() - v_started_at;
 
-    CREATE TEMP TABLE tmp_gbbps_scheme ON COMMIT DROP AS
-    WITH owners AS MATERIALIZED (
-        SELECT DISTINCT 
-        	b.owner_sharer_id AS sharer_id, 
-        	b.fl_contract_id AS contract_id,
-            false AS is_ul, 
-            pis.portfolio,
-            case
-	            when sharer_product.id is not null
-	            then sharer_product.id
-	            else contract_product.id
-	        end as product_id
-        FROM pg_temp.tmp_gbbps_balance b
-        left join lateral (
-			select distinct on (sph.sharer_id)
-				sph.pens_product_id as id
-			from ourpension.sharer_product_history sph
-			where sph.sharer_id = s.id
-				and sph.begin_date < v_datetime_end
-				and (sph.end_date is null or sph.end_date > p_start_date)
-			order by sph.sharer_id, sph.begin_date desc, sph.id desc
-		) sharer_product on true
-		left join lateral (
-			select distinct on (cph.contract_id)
-				cph.pens_product_id as id
-			from ourpension.contract_product_history cph
-			where cph.contract_id = c.id
-				and cph.begin_date < v_datetime_end
-				and (cph.end_date is null or cph.end_date > p_start_date)
-			order by cph.contract_id, cph.begin_date desc
-		) contract_product on true
-        left join lateral (
-	    	select
-	    		his.name as portfolio
-	    	from ourpension.invest_strategy_history_sharer ishs
-	    	join prod_line.hb_invest_strategy his on his.id = ishs.strategy_id
-	    	where ishs.sharer_id = b.owner_sharer_id
-	    		and ishs.begin_date <= p_end_date
-				and (ishs.end_date is null or ishs.end_date >= p_start_date)
-	    	order by ishs.begin_date desc, ishs.id desc
-	    	limit 1
-	    ) pis on true
-        WHERE b.owner_sharer_id IS NOT NULL
+		v_started_at := clock_timestamp();
 
-        UNION ALL
+		-- История назначений. При нескольких записях за день берем последнюю.
+		-- Для ЮЛ владельцем баланса служит договор. Для ФЛ — счет участника.
+		create temp table tmp_gbbps_product on commit drop as
+		with history as (
+			select
+				false as is_ul,
+				h.sharer_id as owner_id,
+				h.begin_date,
+				h.end_date,
+				h.pens_product_id as product_id,
+				h.id as event_id
+			from ourpension.sharer_product_history h
+			join (select distinct b.owner_sharer_id from pg_temp.tmp_gbbps_balance b
+					where b.owner_sharer_id is not null) o on o.owner_sharer_id = h.sharer_id
+			where h.begin_date < p_end_date + 1
 
-        SELECT 
-        	s.id, 
-        	k.contract_id, 
-        	true AS is_ul, 
-        	pis.portfolio,
-        	case
-	            when contract_product.id is not null
-	            then contract_product.id
-	            else sharer_product.id
-	        end as product_id
-        FROM (
-            SELECT DISTINCT b.owner_contract_id AS contract_id
-            FROM pg_temp.tmp_gbbps_balance b
-            WHERE b.owner_contract_id IS NOT NULL
-        ) k
-        JOIN ourpension.sharer s ON s.contract_id = k.contract_id
-        left join lateral (
-			select distinct on (sph.sharer_id)
-				sph.pens_product_id as id
-			from ourpension.sharer_product_history sph
-			where sph.sharer_id = s.id
-				and sph.begin_date < v_datetime_end
-				and (sph.end_date is null or sph.end_date > p_start_date)
-			order by sph.sharer_id, sph.begin_date desc, sph.id desc
-		) sharer_product on true
-		left join lateral (
-			select distinct on (cph.contract_id)
-				cph.pens_product_id as id
-			from ourpension.contract_product_history cph
-			where cph.contract_id = c.id
-				and cph.begin_date < v_datetime_end
-				and (cph.end_date is null or cph.end_date > p_start_date)
-			order by cph.contract_id, cph.begin_date desc
-		) contract_product on true
-        left join lateral (
-    		select
-    			his.name as portfolio
-	    	from ourpension.invest_strategy_history_sharer ishs
-	    	join prod_line.hb_invest_strategy his on his.id = ishs.strategy_id
-	    	where ishs.sharer_id = s.id
-	    		and ishs.begin_date <= p_end_date
-				and (ishs.end_date is null or ishs.end_date >= p_start_date)
-	    	order by ishs.begin_date desc, ishs.id desc
-	    	limit 1
-	    ) pis on true
-        WHERE s.individual_id IS NULL
-    ),
-    scheme_result AS MATERIALIZED (
-        SELECT o.is_ul, o.sharer_id, o.contract_id,
-               pp.name AS scheme_name, o.portfolio AS portfolio
-        FROM owners o
-        left join prod_line.pens_product pp on pp.id = o.product_id
-    ),
-    pension_schemes AS (
-        SELECT o.sharer_id, o.contract_id, o.is_ul, r.scheme_name, r.portfolio as portfolio
-        FROM scheme_result r
-        JOIN owners o ON o.is_ul = r.is_ul AND o.sharer_id = r.sharer_id
-                     AND (NOT o.is_ul OR o.contract_id = r.contract_id)
-    )
-    SELECT ps.sharer_id, ps.contract_id, ps.is_ul, ps.scheme_name, ps.portfolio,
-           CASE WHEN sp.sharer_type IN ('SPS_U', 'SPS_P', 'SPS') THEN 'СПС'
-                WHEN sp.sharer_type IN ('KIPS', 'IPS_P', 'IPS') THEN 'ИПС'
-                WHEN sp.sharer_type = 'SDS' THEN 'СДС'
-           END AS account_form
-    FROM pension_schemes ps
-    JOIN ourpension.sharer_params sp ON sp.sharer_id = ps.sharer_id;
+			union all
 
-    GET DIAGNOSTICS v_rows = ROW_COUNT;
-    ANALYZE pg_temp.tmp_gbbps_scheme;
-    RAISE NOTICE 'Подбор владельцев и пенсионных схем: % строк, %', v_rows, clock_timestamp() - v_started_at;
+			select
+				true,
+				h.contract_id,
+				h.begin_date,
+				h.end_date,
+				h.pens_product_id,
+				h.id
+			from ourpension.contract_product_history h
+			join (select distinct b.owner_contract_id from pg_temp.tmp_gbbps_balance b
+					where b.owner_contract_id is not null) o on o.owner_contract_id = h.contract_id
+			where h.begin_date < p_end_date + 1
+		),
+		last_in_day as (
+			select distinct on (h.is_ul, h.owner_id, h.begin_date::date)
+				h.is_ul,
+				h.owner_id,
+				h.begin_date::date as dt,
+				h.end_date,
+				h.product_id
+			from history h
+			order by h.is_ul, h.owner_id, h.begin_date::date, h.begin_date desc, h.event_id desc
+		),
+		periods as (
+			select
+				h.*,
+				lead(h.dt) over (partition by h.is_ul, h.owner_id order by h.dt) as next_dt
+			from last_in_day h
+		)
+		select
+			h.is_ul,
+			h.owner_id,
+			greatest(h.dt, p_start_date) as dt_from,
+			least(h.next_dt, h.end_date::date, p_end_date + 1) as dt_until,
+			pp.name::text as product_name
+		from periods h
+		left join prod_line.pens_product pp on pp.id = h.product_id
+		where greatest(h.dt, p_start_date) < least(h.next_dt, h.end_date::date, p_end_date + 1);
 
-    v_started_at := clock_timestamp();
+		create index on tmp_gbbps_product (is_ul, owner_id, dt_from);
+		analyze pg_temp.tmp_gbbps_product;
+		raise notice 'История продуктов: %', clock_timestamp() - v_started_at;
+		v_started_at := clock_timestamp();
 
-    RETURN QUERY
-    WITH base AS (
-        SELECT b.start_date, b.end_date, b.amount,
-               ps.scheme_name, ps.portfolio, ps.account_form, 'ФЛ'::text AS owner_type
-        FROM pg_temp.tmp_gbbps_balance b
-        JOIN pg_temp.tmp_gbbps_scheme ps ON ps.sharer_id = b.owner_sharer_id
-        WHERE NOT ps.is_ul
+		return query
+			with balances as (
+				select
+					x.is_ul,
+					x.owner_id,
+					b.start_date,
+					b.end_date,
+					b.amount
+				from pg_temp.tmp_gbbps_balance b
+				cross join lateral (values
+					(false, b.owner_sharer_id), (true, b.owner_contract_id)
+				) x(is_ul, owner_id)
+				where x.owner_id is not null
+			),
+			events as (
+				select
+					b.is_ul,
+					b.owner_id,
+					e.dt,
+					sum(e.delta) as delta
+				from balances b
+				cross join lateral (values
+					(greatest(b.start_date, p_start_date), b.amount),
+					(case when b.end_date < p_end_date then b.end_date + 1 end, -b.amount)
+				) e(dt, delta)
+				where e.dt is not null
+				group by b.is_ul, b.owner_id, e.dt
+			),
+			owner_balance as (
+				select
+					e.is_ul,
+					e.owner_id,
+					e.dt as dt_from,
+					lead(e.dt, 1, p_end_date + 1) over w as dt_until,
+					(sum(e.delta) over w)::numeric(35,2) as amount
+				from events e
+				window w as (partition by e.is_ul, e.owner_id order by e.dt)
+			),
+			-- Начисляем весь баланс в группу NULL. На период известного продукта
+			-- переносим соответствующую сумму из NULL в группу продукта.
+			segments as (
+				select
+					null::text as product_name,
+					b.dt_from,
+					b.dt_until,
+					b.amount
+				from owner_balance b
+				where b.amount <> 0
 
-        UNION ALL
+				union all
 
-        SELECT b.start_date, b.end_date, b.amount,
-               ps.scheme_name, ps.portfolio, ps.account_form, 'ЮЛ'::text
-        FROM pg_temp.tmp_gbbps_balance b
-        JOIN pg_temp.tmp_gbbps_scheme ps ON ps.contract_id = b.owner_contract_id
-        WHERE ps.is_ul
-    ),
-    daily_movements AS MATERIALIZED (
-        SELECT e.dt, b.scheme_name, b.portfolio, b.account_form, b.owner_type,
-               sum(e.delta) AS delta
-        FROM base b
-        CROSS JOIN LATERAL (VALUES
-            (greatest(b.start_date, p_start_date), b.amount),
-            (CASE WHEN b.end_date < p_end_date THEN b.end_date + 1 END, -b.amount)
-        ) e(dt, delta)
-        WHERE e.dt IS NOT NULL
-        GROUP BY e.dt, b.scheme_name, b.portfolio, b.account_form, b.owner_type
-    ),
-    groups_in_period AS (
-        SELECT DISTINCT m.scheme_name, m.portfolio, m.account_form, m.owner_type
-        FROM daily_movements m
-    ),
-    days AS (
-        SELECT p_start_date + n AS dt
-        FROM generate_series(0, p_end_date - p_start_date) n
-    )
-    SELECT d.dt, g.scheme_name::text, g.portfolio::text,
-           (sum(m.delta) OVER (
-               PARTITION BY g.scheme_name, g.portfolio, g.account_form, g.owner_type
-               ORDER BY d.dt ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-           ))::numeric,
-           g.account_form::text, g.owner_type
-    FROM groups_in_period g
-    CROSS JOIN days d
-    LEFT JOIN daily_movements m
-      ON m.dt = d.dt AND m.scheme_name = g.scheme_name
-     AND m.portfolio = g.portfolio AND m.account_form = g.account_form
-     AND m.owner_type = g.owner_type
-    ORDER BY g.scheme_name, d.dt;
+				select
+					v.product_name,
+					greatest(b.dt_from, p.dt_from),
+					least(b.dt_until, p.dt_until),
+					v.amount
+				from owner_balance b
+				join pg_temp.tmp_gbbps_product p
+					on p.is_ul = b.is_ul and p.owner_id = b.owner_id
+				and p.dt_from < b.dt_until and b.dt_from < p.dt_until
+				cross join lateral (values (p.product_name, b.amount), (null::text, -b.amount))
+					v(product_name, amount)
+				where p.product_name is not null and b.amount <> 0
+			),
+			product_events as (
+				select
+					s.product_name,
+					e.dt,
+					sum(e.delta) as delta
+				from segments s
+				cross join lateral (values (s.dt_from, s.amount), (s.dt_until, -s.amount))
+					e(dt, delta)
+				where e.dt <= p_end_date
+				group by s.product_name, e.dt
+			),
+			totals as (
+				select
+					e.product_name,
+					e.dt,
+					lead(e.dt, 1, p_end_date + 1) over w as dt_until,
+					sum(e.delta) over w as amount
+				from product_events e
+				window w as (partition by e.product_name order by e.dt)
+			)
+			select
+				t.dt + d.n,
+				t.product_name,
+				null::text,
+				t.amount,
+				null::text,
+				null::text
+			from totals t
+			cross join lateral generate_series(0, t.dt_until - t.dt - 1) d(n)
+			where t.amount <> 0
+			order by 1, 2;
 
-    GET DIAGNOSTICS v_rows = ROW_COUNT;
-    RAISE NOTICE 'Расчет по дням: % строк, %', v_rows, clock_timestamp() - v_started_at;
-
-    DROP TABLE pg_temp.tmp_gbbps_scheme, pg_temp.tmp_gbbps_balance;
-END;
+		raise notice 'Расчет по дням: %', clock_timestamp() - v_started_at;
+		drop table pg_temp.tmp_gbbps_product, pg_temp.tmp_gbbps_balance;
+	end;
 $function$;
-
-' if object_id(''tempdb..#balanceYear'') is not null drop table #balanceYear;
-        create table  #balanceYear ([date] date,[VALUE] decimal(35,2),[SCHEME_CONTRACT] nvarChar(250))
-        declare $day date = $startDate;
-         while $day <= $endDate begin 
-               insert into #balanceYear 
-                               select $day as [date] , [balance].[VALUE] as [VALUE],[product].[SCHEME_CONTRACT]
-                               from [project_xbrl].[pds].[registrSharer] () as [sharer] 
-                                       left join [project_xbrl].[pds].[balanceDate] ($day) as [balance] on [balance].[ID_SHARER] = [sharer].[ID_SHARER] 
-                                       left join (
-                                                      select [account_products].[pds_pension_account_id] as [ID_SHARER],[products].[name] as [SCHEME_CONTRACT],[strategies].[name] as [portfolioInvest]
-                                                      from [dwh].[npf].[pds_pension_account_products] as [account_products]
-                                                           join (select [pds_pension_account_id] ,max([period]) as [period] 
-                                                                   from [dwh].[npf].[pds_pension_account_products] 
-                                                                   where [period] < dateAdd(day,1,$day)
-                                                                   group by [pds_pension_account_id]
-                                                                   ) as [last_account_products] on [account_products].[pds_pension_account_id] = [last_account_products].[pds_pension_account_id] 
-                                                                             and [account_products].[period] = [last_account_products].[period]
-                                                           join [dwh].[npf].[pds_pension_products] as [products] on [account_products].[pds_pension_product_id] = [products].[pds_pension_product_id]
-                                                                                   and [products].[is_marked_for_delete] = 0
-                                                           left join [dwh].[npf].[pds_investment_strategies] as [strategies] on [products].[pds_investment_strategy_id] =  [strategies].[pds_investment_strategy_id]
-                                                                                   and [strategies].[is_marked_for_delete] = 0
-                                                      where [account_products].[period] < dateAdd(day,1,$day)
-                                                      and [account_products].[is_active] = 1
-                                                       ) as [product] on  [product].[ID_SHARER] = [sharer].[ID_SHARER] 
-                                       option(recompile);
-                                       set $day = dateAdd(day,1,$day);
-     end;
-     select [date],sum([Value]),[SCHEME_CONTRACT] as [VALUE] from #balanceYear group by [date],[SCHEME_CONTRACT] having coalesce(sum([Value]),0) != 0;'
