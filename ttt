@@ -591,7 +591,7 @@
 			        		case cp.inheritance_type_code
 			        			when 'FULL_INHERITANCE'
 			        				then 'ПредусмотрПериодНакоплИВыплат'
-			        			when 'PAYOUT_INHERITANCE'
+			        			when 'FUNDED_INHERITANCE'
 			        				then 'ПредусмотрПериодНакопл'
 			        			when 'INHERITANCE_EXCLUDED'
 			        				then 'НеПредусмотрено'
@@ -602,6 +602,7 @@
 			        		''
 			        	)
 		        	end as inheritance_on_accum,
+		            cp.inheritance_type_code,
 		        	case
 			        	when cp.inheritance_type_code is not null
 			        		then 'CONTRACT'
@@ -638,6 +639,7 @@
 		    inheritance_mode as (
 		        select
 		        	c.inheritance_source_type,
+		            c.inheritance_type_code,
 		            c.inheritance_on_pay,
 		            c.inheritance_on_accum,
 		            c.inheritance_type,
@@ -696,6 +698,7 @@
 		    inheritance_decision as (
 		        select
 		        	im.inheritance_source_type,
+		            im.inheritance_type_code,
 		            im.inheritance_on_pay,
 		            im.inheritance_on_accum,
 		            im.on_pay,
@@ -712,11 +715,13 @@
 		            ap.last_status_date,
 		            ap.previous_status_code,
 		            ap.previous_status_name,
+		            -- On IA0 the effective period comes from the previous GA0/HA0 status.
+		            -- Closed-account reason and balance eligibility are selected upstream.
 		            case
-		                when im.inheritance_type = 'FULL' then true
+		                when im.inheritance_type = 'FULL'
+		                    then ap.account_phase in ('ACCUM', 'PAY')
 		                when im.inheritance_type = 'ACCUM_ONLY'
 		                    then ap.account_phase = 'ACCUM'
-		                         or ap.last_status_code = 'IA0'
 		                when im.inheritance_type = 'PAY_ONLY'
 		                    then ap.account_phase = 'PAY'
 		                else false
@@ -726,7 +731,6 @@
 		                or (
 		                    im.inheritance_type = 'ACCUM_ONLY'
 		                    and ap.account_phase = 'PAY'
-		                    and ap.last_status_code <> 'IA0'
 		                )
 		            ) as requires_arrears_calculation,
 		            case
@@ -739,16 +743,25 @@
 		                when im.inheritance_type = 'EXCLUDED'
 		                     and dp.death_date is null
 		                    then 'DEATH_DATE_REQUIRED_FOR_SETTLEMENT'
+		                when im.inheritance_source_type = 'CONTRACT'
+		                     and im.inheritance_type = 'UNRESOLVED'
+		                     and im.inheritance_type_code not in (
+		                         'FULL_INHERITANCE', 'FUNDED_INHERITANCE',
+		                         'PAYOUT_INHERITANCE', 'INHERITANCE_EXCLUDED'
+		                     )
+		                    then 'CONTRACT_INHERITANCE_TYPE_UNKNOWN'
 		                when im.inheritance_type = 'UNRESOLVED'
 		                     and im.inheritance_on_pay is null
 		                     and im.inheritance_on_accum is null
 		                    then 'INHERITANCE_SOURCE_VALUE_REQUIRED'
 		                when im.inheritance_type = 'UNRESOLVED'
 		                    then 'INHERITANCE_ATTRIBUTES_INCONSISTENT'
-		                when im.inheritance_type in ('ACCUM_ONLY','PAY_ONLY')
+		                when im.inheritance_type in ('FULL','ACCUM_ONLY','PAY_ONLY')
 		                    and ap.account_phase = 'UNKNOWN'
-		                    and not (im.inheritance_type = 'ACCUM_ONLY'
-		                             and ap.last_status_code = 'IA0')
+		                    and ap.last_status_code = 'IA0'
+		                    then 'CLOSED_ACCOUNT_PREVIOUS_PHASE_UNKNOWN'
+		                when im.inheritance_type in ('FULL','ACCUM_ONLY','PAY_ONLY')
+		                    and ap.account_phase = 'UNKNOWN'
 		                    then 'ACCOUNT_PHASE_UNKNOWN'
 		                else null::text
 		            end as calculation_warning
@@ -1267,6 +1280,11 @@
 		    calc_vykup as (
 		        select
 		            case
+		                when idec.inheritance_type = 'UNRESOLVED'
+		                    then null::numeric
+		                when idec.inheritance_type in ('FULL', 'ACCUM_ONLY', 'PAY_ONLY')
+		                     and idec.account_phase = 'UNKNOWN'
+		                    then null::numeric
 		                when idec.use_standard_redemption
 		                    then v.s_vykup_full * cp.d
 		                when idec.inheritance_type = 'EXCLUDED'
@@ -1276,8 +1294,6 @@
 		                    ) * cp.d
 		                when idec.requires_arrears_calculation
 		                    then par.arrears_total * cp.d
-		                when idec.inheritance_type = 'UNRESOLVED'
-		                    then null::numeric
 		                else 0::numeric
 		            end as s_vykup,
 		            case
@@ -1395,8 +1411,7 @@
 		    select
 		        case
 		            when idec.inheritance_type = 'UNRESOLVED'
-		              or cp.d is null
-		              or (idec.requires_arrears_calculation and cv.s_vykup is null)
+		              or cv.s_vykup is null
 		                then null::numeric
 		            else coalesce((
 		                select r.pension
@@ -1433,7 +1448,7 @@
 		        coalesce(cp1.k3, 0)::numeric,
 		        coalesce(cp1.k4, 0)::numeric,
 		        coalesce(cp1.kf, 0)::numeric,
-		        coalesce(cp.d, 0)::numeric,
+		        cp.d::numeric,
 		        jsonb_build_object(
 		            'credit_included',
 		            coalesce(tij.credit_included_json, '[]'::jsonb),
@@ -1458,6 +1473,7 @@
 		                'inheritance_on_pay', idec.inheritance_on_pay,
 		                'inheritance_on_accum', idec.inheritance_on_accum,
 		                'inheritance_source_type', idec.inheritance_source_type,
+		                'inheritance_type_code', idec.inheritance_type_code,
 		                'on_pay', idec.on_pay,
 		                'on_accum', idec.on_accum,
 		                'inheritance_type', idec.inheritance_type,
@@ -1467,6 +1483,16 @@
 		                'previous_status_code', idec.previous_status_code,
 		                'previous_status_name', idec.previous_status_name,
 		                'use_standard_redemption', idec.use_standard_redemption,
+		                'standard_blocked_by_inheritance_phase',
+		                    (idec.inheritance_type = 'ACCUM_ONLY'
+		                     and idec.account_phase = 'PAY')
+		                    or (idec.inheritance_type = 'PAY_ONLY'
+		                        and idec.account_phase = 'ACCUM'),
+		                'closed_account_phase_from_previous_status',
+		                    (idec.last_status_code = 'IA0'),
+		                'closed_account_eligibility_checked_in_this_function',
+		                    case when idec.last_status_code = 'IA0'
+		                         then false else null::boolean end,
 		                'inheritance_classification_valid',
 		                    idec.inheritance_type <> 'UNRESOLVED',
 		                'calculation_warning', idec.calculation_warning,
